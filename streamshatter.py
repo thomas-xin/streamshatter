@@ -97,10 +97,9 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	print(s, end="\r")
 	if ctx["forkable"] and len(ctx["chunkinfo"]) < ctx["limit"]:
 		if ct - ctx["last_split"] > 1 and bps > ctx["last_bps"]:
-			ctx["last_bps"] = bps
-			ctx["last_split"] = time.perf_counter()
 			# Allow no more than 4 stalled/errored requests at a time
-			return sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4
+			if sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4:
+				return True
 		elif ct - ctx["last_split"] > 5:
 			ctx["last_bps"] = bps
 			ctx["last_split"] = time.perf_counter()
@@ -130,7 +129,11 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 						split = update_progress(ctx)
 						if chunk[-1] == size:
 							break
-						if split and chunk[-1] + chunk_size < size:
+						if split and chunk[-1] + chunk_size < size and size - chunk[-1] >= max(chunk[1] - chunk[-1] for chunk in ctx["chunkinfo"]) / 2:
+							ct = time.perf_counter()
+							bps = sum(chunk[3] / max(0.001, ct - chunk[2]) for chunk in ctx["chunkinfo"]) * 8
+							ctx["last_bps"] = bps
+							ctx["last_split"] = time.perf_counter()
 							start = chunk[0]
 							offset = round((chunk[-1] + size) / 2)
 							chunk2 = [start + offset, size - offset, time.perf_counter(), 0, 0]
@@ -221,7 +224,10 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 		update_progress(ctx, force=True, use_original_timestamp=True)
 	finally:
 		for file in removes:
-			os.remove(file)
+			try:
+				os.remove(file)
+			except (FileNotFoundError, PermissionError):
+				pass
 
 
 try:
