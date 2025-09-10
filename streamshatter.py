@@ -89,26 +89,27 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	else:
 		bps = sum(chunk[3] / max(0.001, ct - chunk[2]) for chunk in ctx["chunkinfo"]) * 8
 	bpst = calc_bps(bps)
-	s2 = f" {timer} ({percentage}%, {bpst})"
+	completed = sum(chunk[-1] == chunk[1] for chunk in ctx["chunkinfo"])
+	s2 = f" {timer} {completed}/{len(ctx['chunkinfo'])} ({percentage}%, {bpst})"
 	chars = min(maxbar, len(ctx["chunkinfo"])) + len(s2)
 	s += "\x1b[38;5;7m" + s2
-	s += " " * (100 - chars)
+	s += " " * (120 - chars)
 	print(s, end="\r")
-	if ctx["forkable"] and len(ctx["chunkinfo"]) < ctx["limit"] and ct - ctx["last_split"] > 1 and bps > ctx["last_bps"]:
-		ctx["last_bps"] = bps
-		ctx["last_split"] = time.perf_counter()
-		# Allow no more than 4 stalled/errored requests at a time
-		return sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4
-	elif ct - ctx["last_split"] > 5:
-		ctx["last_bps"] = bps
-		ctx["last_split"] = time.perf_counter()
+	if ctx["forkable"] and len(ctx["chunkinfo"]) < ctx["limit"]:
+		if ct - ctx["last_split"] > 1 and bps > ctx["last_bps"]:
+			ctx["last_bps"] = bps
+			ctx["last_split"] = time.perf_counter()
+			# Allow no more than 4 stalled/errored requests at a time
+			return sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4
+		elif ct - ctx["last_split"] > 5:
+			ctx["last_bps"] = bps
+			ctx["last_split"] = time.perf_counter()
 
 async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	file = os.path.join(ctx["cache_folder"], nth_file(uhash(url), len(ctx["chunkinfo"])))
 	ctx["chunkinfo"].append(chunk)
 	attempts = 0
-	fn = file + "~"
-	with open(fn, "wb+") as f:
+	with open(file, "wb+") as f:
 		while True:
 			timeout = (attempts + 1) * 5
 			try:
@@ -174,7 +175,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			await asyncio.sleep((attempts + random.random()) ** 2 + 1)
 			attempts += 1
 			globals()["session"] = niquests.AsyncSession()
-	os.replace(fn, file)
+	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
 async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024):
