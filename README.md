@@ -1,26 +1,29 @@
-# Downloader
-A multithreaded HTTP file downloader that will resume downloads upon disconnect errors.
+# StreamShatter
+Originally a very basic script for reliably downloading files from servers with inconsistent connections, this project has been revisited and modernised to use https://github.com/jawah/niquests to greatly improve multiplexing performance, for those who still have use for such a tool.
 
-Achieves up to 3x download speed efficiency compared to other methods of download (browser, curl, etc), with much better stability.
+StreamShatter takes advantage of the `Range` HTTP header to dynamically allocate multiple chunks, by starting with one streaming request and gradually bisecting it while bandwidth permits, all without restarting the download. This allows for single, large file downloads from hosts that, whether intentionally or unintentionally, have degraded throughputs. The individual chunks also serve as checkpoints for if/when connections are broken.
 
-Has a small amount of machine learning built-in, which will adjust the amount of threads used based on the speeds of previous downloads.
-
-Visualises the download's progress as a bar of chunks that fill up individually based on that chunk's independent progress.
-
-Currently requires the `requests` python package as a dependency for uploading.
+# Installation
+- Install [python](https://www.python.org) and [pip](https://pip.pypa.io/en/stable/)
+- Install StreamShatter as a package:
+`pip install streamshatter`
 
 ## Usage
-The last argument (name of output file) is optional, and will be automatically determined if not provided (this will put the file in a folder named `files`). If the URL is not provided, the user will be prompted to input one after the program starts. And finally, if the `-threads x` arguments are not provided, it will automatically be determined based on the file's size as well as the speed of previously downloaded files if applicable.
+```ini
+usage: streamshatter [-h] [-V] [-H HEADERS] [-c CACHE_FOLDER] [-l LIMIT] url [filename]
 
-Additionally, the `-v` (verbose) flag will cause the progress bar to move downwards instead of overwriting itself.
-### Windows
-`python downloader.py -threads 12 http://speedcheck.cdn.on.net/1000meg.test file.bin`
+Multiplexed chunked file downloader
 
-`py downloader.py http://speedcheck.cdn.on.net/1000meg.test`
-### Linux
-`python3 downloader.py -threads 12 http://speedcheck.cdn.on.net/1000meg.test file.bin`
+positional arguments:
+  url                   Target URL
+  filename              Output filename
 
-`python3 downloader.py http://speedcheck.cdn.on.net/1000meg.test`
-
-### Uploading
-The `-u` flag will instead attempt to upload a file to https://mizabot.xyz/files, where it will be stored for an indefinite amount of time. The program will output a link to the file's hosting page once complete. Use this if your file is too large for your browser to handle!
+options:
+  -h, --help            show this help message and exit
+  -V, --version         show program's version number and exit
+  -H, --headers HEADERS
+                        HTTP headers, interpreted as JSON
+  -c, --cache-folder CACHE_FOLDER
+                        Folder to store temporary files
+  -l, --limit LIMIT     Limits the amount of chunks to download
+```
