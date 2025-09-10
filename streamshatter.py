@@ -210,25 +210,19 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	fut = asyncio.create_task(write_request(ctx, chunk, resp, url, method, headers, data, filename))
 	fut.start = 0
 	ctx["workers"].append(fut)
-	removes = []
-	try:
-		fn = filename + "~"
-		with open(fn, "ab") as f:
-			f.truncate(0)
-			while ctx["workers"]:
-				file = await ctx["workers"].pop(0)
-				with open(file, "rb") as g:
-					shutil.copyfileobj(g, f)
-				removes.append(file)
-		os.replace(fn, filename)
-		update_progress(ctx, force=True, use_original_timestamp=True)
-	finally:
-		for file in removes:
+	fn = filename + "~"
+	with open(fn, "ab") as f:
+		f.truncate(0)
+		while ctx["workers"]:
+			file = await ctx["workers"].pop(0)
+			with open(file, "rb") as g:
+				shutil.copyfileobj(g, f)
 			try:
 				os.remove(file)
-			except (FileNotFoundError, PermissionError):
+			except Exception:
 				pass
-
+	os.replace(fn, filename)
+	update_progress(ctx, force=True, use_original_timestamp=True)
 
 try:
 	from importlib.metadata import version
