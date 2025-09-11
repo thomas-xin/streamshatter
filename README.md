@@ -3,7 +3,7 @@ Originally a very basic script for reliably downloading files from servers with 
 
 StreamShatter takes advantage of the `Range` HTTP header to dynamically allocate multiple chunks, by starting with one streaming request and gradually bisecting it while bandwidth permits, all without restarting the download. This allows for single, large file downloads from hosts that, whether intentionally or unintentionally, have degraded throughputs. The individual chunks also serve as checkpoints for if/when connections are broken.
 
-<video width="960" height="540" muted controls src="https://mizabot.xyz/u/-KLSsIklGJ_wxOHH4xH332ACdm0F/StreamShatter_Demo_-_Made_with_Clipchamp.mp4"></video>
+[![StreamShatter Demo]](https://mizabot.xyz/u/-KLSsIklGJ_wxOHH4xH332ACdm0F/StreamShatter_Demo_-_Made_with_Clipchamp.mp4)
 <i>Demo using a normally slow (&lt;1Mbps) server, with simulated network failures at 50%, 90% and 99.5% download progress. No data is lost and the resulting file is intact.</i>
 
 # Installation
