@@ -10,13 +10,17 @@ import time
 from urllib.parse import quote_plus
 import niquests
 
-session = niquests.AsyncSession()
 chunk_size = 1048576
 base_chunk = 65536
 COLOURS = ["\x1b[38;5;16m█"]
 COLOURS.extend(f"\x1b[38;5;{i}m█" for i in range(232, 256))
 COLOURS.append("\x1b[38;5;15m█")
 
+session = None
+def generate_session():
+	globals()["session"] = niquests.AsyncSession(multiplexed=True)
+	return session
+generate_session()
 def shash(s): return base64.urlsafe_b64encode(hashlib.sha256(s if type(s) is bytes else str(s).encode("utf-8")).digest()).rstrip(b"==").decode("ascii")
 def uhash(s): return min([shash(s), quote_plus(s.removeprefix("https://"))], key=len)
 def header():
@@ -26,7 +30,7 @@ def header():
 		"X-Forwarded-For": ".".join(str(random.randint(0, 255)) for _ in range(4)),
 	}
 def nth_file(tag, chunk=0):
-	return base64.urlsafe_b64encode(chunk.to_bytes(ceil(chunk.bit_length() / 8), "big")).rstrip(b"==").decode("ascii") + "~" + tag
+	return base64.urlsafe_b64encode(chunk.to_bytes(chunk.bit_length() + 7 >> 3, "big")).rstrip(b"==").decode("ascii") + "~" + tag
 def box(i):
 	if i < 0:
 		return "\x1b[38;5;196m█"
@@ -78,7 +82,7 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	maxbar = 64
 	samples = [chunk[-1] / chunk[1] for chunk in ctx["chunkinfo"]]
 	s = "".join(map(box, sample(samples, maxbar)))
-	dt = ct - ctx["start"]
+	dt = max(0.001, ct - ctx["start"])
 	timer = time_disp(dt)
 	progress = sum(chunk[-1] for chunk in ctx["chunkinfo"])
 	percentage = round(progress / ctx["size"] * 100, 4)
@@ -87,7 +91,11 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	if use_original_timestamp:
 		bps = ctx["size"] * 8 / dt
 	else:
-		bps = sum(chunk[3] / max(0.001, ct - chunk[2]) for chunk in ctx["chunkinfo"]) * 8
+		for i, d in enumerate(ctx["deltas"]):
+			if ct < d[0] + 5:
+				break
+		ctx["deltas"] = ctx["deltas"][i:]
+		bps = sum(d[1] for d in ctx["deltas"]) * 8 / min(5, dt)
 	bpst = calc_bps(bps)
 	completed = sum(chunk[-1] == chunk[1] for chunk in ctx["chunkinfo"])
 	s2 = f" {timer} {completed}/{len(ctx['chunkinfo'])} ({percentage}%, {bpst})"
@@ -105,7 +113,8 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 			ctx["last_split"] = time.perf_counter()
 
 async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
-	file = os.path.join(ctx["cache_folder"], nth_file(uhash(url), len(ctx["chunkinfo"])))
+	start = chunk[0]
+	file = os.path.join(ctx["cache_folder"], nth_file(uhash(url), start))
 	ctx["chunkinfo"].append(chunk)
 	attempts = 0
 	with open(file, "wb+") as f:
@@ -114,56 +123,67 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			try:
 				if not resp:
 					resp = await asyncio.wait_for(session.request(method, url, headers=headers, data=data, stream=True, timeout=timeout), timeout=timeout + 1)
-					resp.raise_for_status()
+				it = await asyncio.wait_for(resp.iter_content(base_chunk), timeout=timeout)
+				resp.raise_for_status()
 				if "Range" in headers:
 					assert resp.headers["content-range"].split("/", 1)[0].split(None, 1)[-1] == headers["Range"].split("=", 1)[-1], "Server failed to serve range header as specified!"
-				chunk[-2] = time.perf_counter()
-				it = await asyncio.wait_for(resp.iter_content(base_chunk), timeout=timeout)
 				size = chunk[1]
 				try:
 					while True:
-						data = await asyncio.wait_for(it.__anext__(), timeout=timeout)
+						fut = it.__anext__()
+						try:
+							data = await asyncio.wait_for(fut, timeout=timeout)
+						except AttributeError:
+							raise TimeoutError
 						f.write(data)
 						chunk[-1] = min(max(len(data), chunk[-1] + len(data)), size)
-						chunk[3] += len(data)
+						ctx["deltas"].append((time.perf_counter(), len(data)))
 						split = update_progress(ctx)
 						if chunk[-1] == size:
 							break
 						if split and chunk[-1] + chunk_size < size and size - chunk[-1] >= max(chunk[1] - chunk[-1] for chunk in ctx["chunkinfo"]) / 2:
 							ct = time.perf_counter()
-							bps = sum(chunk[3] / max(0.001, ct - chunk[2]) for chunk in ctx["chunkinfo"]) * 8
-							ctx["last_bps"] = bps
+							dt = max(0.001, ct - ctx["start"])
+							ctx["last_bps"] = sum(d[1] for d in ctx["deltas"]) * 8 / min(5, dt)
 							ctx["last_split"] = time.perf_counter()
-							start = chunk[0]
 							offset = round((chunk[-1] + size) / 2)
-							chunk2 = [start + offset, size - offset, time.perf_counter(), 0, 0]
+							chunk2 = [start + offset, size - offset, 0]
 							rheaders = headers.copy()
 							rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}"
 							fut = asyncio.create_task(write_request(ctx, chunk2, None, resp.url, method, rheaders, data, filename))
 							fut.start = chunk2[0]
 							ctx["workers"].append(fut)
-							# Important invariant: Newly bisected worker will always be after the current one in the list
-							ctx["workers"].sort(key=lambda fut: fut.start)
 							size = chunk[1] = offset
-							chunk[2] = time.perf_counter()
-							chunk[3] = len(data)
 				except (StopIteration, StopAsyncIteration):
 					pass
 				f.flush()
 				f.truncate(size)
 				f.seek(0, os.SEEK_END)
 				assert f.tell() == size, (f.tell, size)
-			except (TimeoutError, asyncio.TimeoutError):
-				pass
+			except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, niquests.ConnectionError, niquests.ConnectTimeout, niquests.ReadTimeout, niquests.Timeout, niquests.exceptions.ChunkedEncodingError):
+				size = chunk[1]
+				offset = chunk[-1]
+				# If a simple error occurs (e.g. timeout) but some data was already received, create a new request and end the current one
+				if offset > 0:
+					generate_session()
+					if offset < size:
+						chunk2 = [start + offset, size - offset, 0]
+						rheaders = headers.copy()
+						rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}"
+						fut = asyncio.create_task(write_request(ctx, chunk2, None, url, method, rheaders, data, filename))
+						fut.start = chunk2[0]
+						ctx["workers"].append(fut)
+						size = chunk[1] = offset
+					chunk[-1] = size
+					break
 			except Exception as ex:
 				print(repr(ex))
+				raise
 			else:
 				chunk[-1] = size
-				chunk[2] = time.perf_counter()
-				chunk[3] = base_chunk
 				break
 			finally:
-				if resp:
+				if resp is not None:
 					try:
 						await asyncio.wait_for(resp.close(), timeout=timeout)
 					except Exception:
@@ -172,12 +192,10 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			f.seek(0)
 			f.truncate(0)
 			chunk[-1] = -0.01
-			chunk[2] = time.perf_counter()
-			chunk[3] = 0
 			update_progress(ctx, force=True)
 			await asyncio.sleep((attempts + random.random()) ** 2 + 1)
 			attempts += 1
-			globals()["session"] = niquests.AsyncSession()
+			generate_session()
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
@@ -186,13 +204,14 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	head = header()
 	head.update(headers)
 	resp = await session.request(method, url, headers=head, data=data, stream=True)
+	await resp.iter_content(base_chunk * 2)
 	resp.raise_for_status()
 	filename = filename or resp.headers.get("attachment-filename") or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
 	try:
 		size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
 	except (KeyError, ValueError):
 		size = -1
-	chunk = [0, size, time.perf_counter(), 0, 0, 0]
+	chunk = [0, size, 0]
 	single = limit <= 1 or size <= 0 or "bytes" not in resp.headers.get("accept-ranges", "").casefold()
 	ctx = dict(
 		url=url,
@@ -204,6 +223,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 		cache_folder=cache_folder,
 		limit=limit,
 		forkable=not single,
+		deltas=[],
 		chunkinfo=[],
 		workers=[],
 	)
@@ -214,6 +234,8 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	with open(fn, "ab") as f:
 		f.truncate(0)
 		while ctx["workers"]:
+			# Important invariant: Newly bisected workers will always be after the original ones in the list
+			ctx["workers"].sort(key=lambda fut: fut.start)
 			file = await ctx["workers"].pop(0)
 			with open(file, "rb") as g:
 				shutil.copyfileobj(g, f)
@@ -221,6 +243,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 				os.remove(file)
 			except Exception:
 				pass
+	assert os.path.exists(fn) and os.path.getsize(fn) == size, f"Expected {size} bytes, received {os.path.getsize(fn)}"
 	os.replace(fn, filename)
 	update_progress(ctx, force=True, use_original_timestamp=True)
 
