@@ -14,7 +14,7 @@ StreamShatter takes advantage of the `Range` HTTP header to dynamically allocate
 `pip install streamshatter`
 
 ## Usage
-```ini
+```
 usage: streamshatter [-h] [-V] [-H HEADERS] [-c CACHE_FOLDER] [-l LIMIT] [-s | --ssl | --no-ssl] [-d | --debug | --no-debug] url [filename]
 
 Multiplexed chunked file downloader
@@ -30,8 +30,8 @@ options:
                         HTTP headers, interpreted as JSON
   -c, --cache-folder CACHE_FOLDER
                         Folder to store temporary files
-  -l, --limit LIMIT     Limits the amount of chunks to download
-  -s, --ssl, --no-ssl   Enforces SSL verification
+  -l, --limit LIMIT     Limits the amount of chunks to download; defaults to 1024
+  -s, --ssl, --no-ssl   Enforces SSL verification; defaults to TRUE
   -d, --debug, --no-debug
-                        Terminates immediately upon non-timeout errors, and writes the response data for errored chunks
+                        Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE
 ```
