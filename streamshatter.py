@@ -25,6 +25,7 @@ def shash(s): return base64.urlsafe_b64encode(hashlib.sha256(s if type(s) is byt
 def uhash(s): return min([shash(s), quote_plus(s.removeprefix("https://"))], key=len)
 def header():
 	return {
+		"Accept": "*/*",
 		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0 AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36 Edg/134.0.3124.85",
 		"DNT": "1",
 		"X-Forwarded-For": ".".join(str(random.randint(0, 255)) for _ in range(4)),
@@ -127,18 +128,18 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 				it = await asyncio.wait_for(resp.iter_content(base_chunk), timeout=timeout)
 				resp.raise_for_status()
 				if "Range" in headers:
-					assert resp.headers["content-range"].split("/", 1)[0].split(None, 1)[-1] == headers["Range"].split("=", 1)[-1], "Server failed to serve range header as specified!"
+					assert resp.headers["content-range"].split("/", 1)[0].split(None, 1)[-1].split("-", 1)[0] == headers["Range"].split("=", 1)[-1].split("-", 1)[0], "Server failed to serve range header as specified!"
 				size = chunk[1]
 				try:
 					while True:
 						fut = it.__anext__()
 						try:
-							data = await asyncio.wait_for(fut, timeout=timeout)
+							content = await asyncio.wait_for(fut, timeout=timeout)
 						except AttributeError:
 							raise TimeoutError
-						f.write(data)
-						chunk[-1] = min(max(len(data), chunk[-1] + len(data)), size)
-						ctx["deltas"].append((time.perf_counter(), len(data)))
+						f.write(content)
+						chunk[-1] = min(max(len(content), chunk[-1] + len(content)), size)
+						ctx["deltas"].append((time.perf_counter(), len(content)))
 						split = update_progress(ctx)
 						if chunk[-1] == size:
 							break
@@ -150,7 +151,8 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 							offset = round((chunk[-1] + size) / 2)
 							chunk2 = [start + offset, size - offset, 0]
 							rheaders = headers.copy()
-							rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}"
+							rheaders["Priority"] = "i"
+							rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}" if ctx["allow_range_ends"] else f"bytes={start + offset}-"
 							fut = asyncio.create_task(write_request(ctx, chunk2, None, resp.url, method, rheaders, data, filename))
 							fut.start = chunk2[0]
 							ctx["workers"].append(fut)
@@ -166,13 +168,15 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, niquests.ConnectionError, niquests.ConnectTimeout, niquests.ReadTimeout, niquests.Timeout, niquests.exceptions.ChunkedEncodingError):
 				size = chunk[1]
 				offset = chunk[-1]
+				chunk[-1] = -0.01
 				# If a simple error occurs (e.g. timeout) but some data was already received, create a new request and end the current one
 				if offset > 0:
 					generate_session()
 					if offset < size:
 						chunk2 = [start + offset, size - offset, 0]
 						rheaders = headers.copy()
-						rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}"
+						rheaders["Priority"] = "i"
+						rheaders["Range"] = f"bytes={start + offset}-{start + size - 1}" if ctx["allow_range_ends"] else f"bytes={start + offset}-"
 						fut = asyncio.create_task(write_request(ctx, chunk2, None, url, method, rheaders, data, filename))
 						fut.start = chunk2[0]
 						ctx["workers"].append(fut)
@@ -180,6 +184,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 					chunk[-1] = size
 					break
 			except Exception as ex:
+				chunk[-1] = -0.01
 				print(repr(ex))
 				if ctx["debug"]:
 					print(resp.headers)
@@ -230,11 +235,12 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 		limit=limit,
 		verify=verify,
 		forkable=not single,
+		allow_range_ends=True,
 		deltas=[],
 		chunkinfo=[],
 		workers=[],
 	)
-	fut = asyncio.create_task(write_request(ctx, chunk, resp, url, method, headers, data, filename))
+	fut = asyncio.create_task(write_request(ctx, chunk, resp, url, method, head, data, filename))
 	fut.start = 0
 	ctx["workers"].append(fut)
 	fn = filename + "~"
