@@ -123,7 +123,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			timeout = (attempts + 1) * 5
 			try:
 				if not resp:
-					resp = await asyncio.wait_for(session.request(method, url, headers=headers, data=data, stream=True, timeout=timeout), timeout=timeout + 1)
+					resp = await asyncio.wait_for(session.request(method, url, headers=headers, data=data, stream=True, timeout=timeout, verify=ctx["verify"]), timeout=timeout + 1)
 				it = await asyncio.wait_for(resp.iter_content(base_chunk), timeout=timeout)
 				resp.raise_for_status()
 				if "Range" in headers:
@@ -204,11 +204,11 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
-async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, debug=False):
+async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, verify=True, debug=False):
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
-	resp = await session.request(method, url, headers=head, data=data, stream=True)
+	resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify)
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
 	filename = filename or resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
@@ -228,6 +228,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 		last_split=0,
 		cache_folder=cache_folder,
 		limit=limit,
+		verify=verify,
 		forkable=not single,
 		deltas=[],
 		chunkinfo=[],
@@ -269,6 +270,7 @@ def main():
 	parser.add_argument("-H", '--headers', help="HTTP headers, interpreted as JSON", required=False, default="{}")
 	parser.add_argument("-c", '--cache-folder', help="Folder to store temporary files", required=False, default=os.path.join(__file__.replace("\\", "/").rsplit("/", 1)[0], "cache"))
 	parser.add_argument("-l", '--limit', help="Limits the amount of chunks to download", type=int, required=False, default=1024)
+	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks")
 	parser.add_argument("url", help="Target URL")
 	parser.add_argument("filename", help="Output filename", nargs="?", default="")
@@ -283,6 +285,7 @@ def main():
 		headers=json.loads(args.headers),
 		cache_folder=args.cache_folder,
 		limit=args.limit,
+		verify=args.ssl,
 		debug=args.debug,
 	))
 
