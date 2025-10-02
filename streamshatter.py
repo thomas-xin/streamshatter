@@ -2,7 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
-from math import ceil, isfinite
+from math import isfinite
 import os
 import random
 import shutil
@@ -11,7 +11,7 @@ from urllib.parse import quote_plus
 import niquests
 
 chunk_size = 1048576
-base_chunk = 65536
+base_chunk = 16384
 COLOURS = ["\x1b[38;5;16m█"]
 COLOURS.extend(f"\x1b[38;5;{i}m█" for i in range(232, 256))
 COLOURS.append("\x1b[38;5;15m█")
@@ -25,7 +25,7 @@ def shash(s): return base64.urlsafe_b64encode(hashlib.sha256(s if type(s) is byt
 def uhash(s): return min([shash(s), quote_plus(s.removeprefix("https://"))], key=len)
 def header():
 	return {
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0 AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36 Edg/134.0.3124.85",
 		"DNT": "1",
 		"X-Forwarded-For": ".".join(str(random.randint(0, 255)) for _ in range(4)),
 	}
@@ -91,6 +91,7 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	if use_original_timestamp:
 		bps = ctx["size"] * 8 / dt
 	else:
+		i = 0
 		for i, d in enumerate(ctx["deltas"]):
 			if ct < d[0] + 5:
 				break
@@ -157,9 +158,11 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 				except (StopIteration, StopAsyncIteration):
 					pass
 				f.flush()
-				f.truncate(size)
+				if size > 0:
+					f.truncate(size)
 				f.seek(0, os.SEEK_END)
-				assert f.tell() == size, (f.tell, size)
+				if size > 0:
+					assert f.tell() == size, (f.tell(), size)
 			except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, niquests.ConnectionError, niquests.ConnectTimeout, niquests.ReadTimeout, niquests.Timeout, niquests.exceptions.ChunkedEncodingError):
 				size = chunk[1]
 				offset = chunk[-1]
@@ -178,7 +181,9 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 					break
 			except Exception as ex:
 				print(repr(ex))
-				raise
+				if ctx["debug"]:
+					print(resp.headers)
+					raise
 			else:
 				chunk[-1] = size
 				break
@@ -199,14 +204,14 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
-async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024):
+async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, debug=False):
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
 	resp = await session.request(method, url, headers=head, data=data, stream=True)
-	await resp.iter_content(base_chunk * 2)
+	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
-	filename = filename or resp.headers.get("attachment-filename") or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+	filename = filename or resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
 	try:
 		size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
 	except (KeyError, ValueError):
@@ -214,6 +219,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	chunk = [0, size, 0]
 	single = limit <= 1 or size <= 0 or "bytes" not in resp.headers.get("accept-ranges", "").casefold()
 	ctx = dict(
+		debug=debug,
 		url=url,
 		start=t,
 		last=0,
@@ -243,7 +249,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 				os.remove(file)
 			except Exception:
 				pass
-	assert os.path.exists(fn) and os.path.getsize(fn) == size, f"Expected {size} bytes, received {os.path.getsize(fn)}"
+	assert os.path.exists(fn) and (size < 0 or os.path.getsize(fn) == size), f"Expected {size} bytes, received {os.path.getsize(fn)}"
 	os.replace(fn, filename)
 	update_progress(ctx, force=True, use_original_timestamp=True)
 
@@ -263,6 +269,7 @@ def main():
 	parser.add_argument("-H", '--headers', help="HTTP headers, interpreted as JSON", required=False, default="{}")
 	parser.add_argument("-c", '--cache-folder', help="Folder to store temporary files", required=False, default=os.path.join(__file__.replace("\\", "/").rsplit("/", 1)[0], "cache"))
 	parser.add_argument("-l", '--limit', help="Limits the amount of chunks to download", type=int, required=False, default=1024)
+	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks")
 	parser.add_argument("url", help="Target URL")
 	parser.add_argument("filename", help="Output filename", nargs="?", default="")
 	args = parser.parse_args()
@@ -276,6 +283,7 @@ def main():
 		headers=json.loads(args.headers),
 		cache_folder=args.cache_folder,
 		limit=args.limit,
+		debug=args.debug,
 	))
 
 if __name__ == "__main__":
