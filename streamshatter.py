@@ -5,7 +5,6 @@ import json
 from math import isfinite
 import os
 import random
-import shutil
 import time
 from urllib.parse import quote_plus
 import niquests
@@ -78,8 +77,9 @@ def sample(arr, n):
 	return arr
 def update_progress(ctx, force=False, use_original_timestamp=False):
 	ct = time.perf_counter()
-	if not force and ct - ctx["last"] < 0.1:
+	if not force and ct - ctx["last"] < 0.03:
 		return
+	ctx["last"] = ct
 	maxbar = 64
 	samples = [chunk[-1] / chunk[1] for chunk in ctx["chunkinfo"]]
 	s = "".join(map(box, sample(samples, maxbar)))
@@ -100,15 +100,19 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 		bps = sum(d[1] for d in ctx["deltas"]) * 8 / min(5, dt)
 	bpst = calc_bps(bps)
 	completed = sum(chunk[-1] == chunk[1] for chunk in ctx["chunkinfo"])
-	s2 = f" {timer} {completed}/{len(ctx['chunkinfo'])} ({percentage}%, {bpst})"
-	chars = min(maxbar, len(ctx["chunkinfo"])) + len(s2)
+	chunk_count = len(ctx["chunkinfo"])
+	s2 = f" {timer} {completed}/{chunk_count} ({percentage}%, {bpst})"
+	chars = min(maxbar, chunk_count) + len(s2)
 	s += "\x1b[38;5;7m" + s2
 	s += " " * (120 - chars)
 	print(s, end="\r")
-	if ctx["forkable"] and len(ctx["chunkinfo"]) < ctx["limit"]:
-		if ct - ctx["last_split"] > 1 and bps > ctx["last_bps"]:
+	if ctx["forkable"] and chunk_count < ctx["limit"]:
+		mcc = ctx.get("max_chunk_count", 0)
+		ccc = chunk_count - completed
+		if ct - ctx["last_split"] > 1 and (bps > ctx["last_bps"] * 1.05 or ccc < mcc):
 			# Allow no more than 4 stalled/errored requests at a time
 			if sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4:
+				ctx["max_chunk_count"] = max(mcc, ccc + 1)
 				return True
 		elif ct - ctx["last_split"] > 5:
 			ctx["last_bps"] = bps
@@ -216,7 +220,15 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify)
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
-	filename = filename or resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+	if not filename:
+		filename = resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+		if "." not in filename:
+			ctype = resp.headers.get("content-type")
+			if ctype and ctype != "application/octet-stream":
+				import mimetypes
+				ext = mimetypes.guess_extension(ctype)
+				if ext:
+					filename = filename + "." + ext
 	try:
 		size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
 	except (KeyError, ValueError):
@@ -244,6 +256,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	fut.start = 0
 	ctx["workers"].append(fut)
 	fn = filename + "~"
+	import shutil
 	with open(fn, "ab") as f:
 		f.truncate(0)
 		while ctx["workers"]:
