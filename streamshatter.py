@@ -5,6 +5,7 @@ import json
 from math import isfinite
 import os
 import random
+import re
 import time
 from urllib.parse import quote_plus
 import niquests
@@ -77,7 +78,7 @@ def sample(arr, n):
 	return arr
 def update_progress(ctx, force=False, use_original_timestamp=False):
 	ct = time.perf_counter()
-	if not force and ct - ctx["last"] < 0.03:
+	if not force and (ct - ctx["last"] < 0.03 or not ctx.get("log_progress", True)):
 		return
 	ctx["last"] = ct
 	maxbar = 64
@@ -213,7 +214,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
-async def parallel_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, verify=True, debug=False):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, verify=True, debug=False, log_progress=True):
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
@@ -221,7 +222,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
 	if not filename:
-		filename = resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+		filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0].strip('"').strip("'"))
 		if "." not in filename:
 			ctype = resp.headers.get("content-type")
 			if ctype and ctype != "application/octet-stream":
@@ -236,13 +237,14 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	chunk = [0, size, 0]
 	single = limit <= 1 or size <= 0 or "bytes" not in resp.headers.get("accept-ranges", "").casefold()
 	ctx = dict(
+		log_progress=log_progress,
 		debug=debug,
 		url=url,
 		start=t,
 		last=0,
 		size=size,
 		last_bps=0,
-		last_split=0,
+		last_split=time.perf_counter(),
 		cache_folder=cache_folder,
 		limit=limit,
 		verify=verify,
@@ -272,6 +274,7 @@ async def parallel_request(url, method="get", headers={}, data=None, filename=No
 	assert os.path.exists(fn) and (size < 0 or os.path.getsize(fn) == size), f"Expected {size} bytes, received {os.path.getsize(fn)}"
 	os.replace(fn, filename)
 	update_progress(ctx, force=True, use_original_timestamp=True)
+parallel_request = shatter_request
 
 try:
 	from importlib.metadata import version
@@ -291,6 +294,7 @@ def main():
 	parser.add_argument("-l", '--limit', help="Limits the amount of chunks to download; defaults to 1024", type=int, required=False, default=1024)
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
+	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
 	parser.add_argument("url", help="Target URL")
 	parser.add_argument("filename", help="Output filename", nargs="?", default="")
 	args = parser.parse_args()
@@ -298,7 +302,7 @@ def main():
 		os.mkdir(args.cache_folder)
 	if os.name == "nt":
 		os.system("color")
-	asyncio.run(parallel_request(
+	asyncio.run(shatter_request(
 		url=args.url,
 		filename=args.filename,
 		headers=json.loads(args.headers),
@@ -306,6 +310,7 @@ def main():
 		limit=args.limit,
 		verify=args.ssl,
 		debug=args.debug,
+		log_progress=args.log_progress,
 	))
 
 if __name__ == "__main__":
