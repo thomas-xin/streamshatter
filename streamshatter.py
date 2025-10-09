@@ -216,7 +216,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, cache_folder="", limit=1024, verify=True, debug=False, log_progress=True):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, cache_folder="", limit=1024, verify=True, debug=False, log_progress=True):
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
@@ -274,18 +274,26 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 			except Exception:
 				pass
 	assert os.path.exists(fn) and (size < 0 or os.path.getsize(fn) == size), f"Expected {size} bytes, received {os.path.getsize(fn)}"
-	os.replace(fn, filename)
+	try:
+		os.replace(fn, filename)
+	except PermissionError:
+		with open(fn, "rb") as f:
+			if not fileobj:
+				fileobj = open(filename, "wb")
+			shutil.copyfileobj(f, fileobj)
+		os.remove(fn)
 	update_progress(ctx, force=True, use_original_timestamp=True)
 parallel_request = shatter_request
 
 async def resolve_file(obj):
 	import pathlib
-	if isinstance(obj, (str, pathlib.Path)):
-		if not is_url(obj):
-			return open(obj, "rb+")
+	if isinstance(obj, pathlib.Path) or isinstance(obj, str) and not is_url(obj):
+		return open(obj, "rb+")
+	if isinstance(obj, str):
 		import tempfile
 		file = tempfile.NamedTemporaryFile()
-		await shatter_request(obj, filanem=file.name)
+		await shatter_request(obj, filename=file.name, fileobj=file, log_progress=False)
+		file.seek(0)
 		return file
 	import tempfile
 	file = tempfile.NamedTemporaryFile()
