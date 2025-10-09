@@ -21,6 +21,8 @@ def generate_session():
 	globals()["session"] = niquests.AsyncSession(multiplexed=True)
 	return session
 generate_session()
+def is_url(url):
+	return "://" in url and url.split("://", 1)[0].rstrip("s") in ("http", "hxxp", "ftp", "fxp")
 def shash(s): return base64.urlsafe_b64encode(hashlib.sha256(s if type(s) is bytes else str(s).encode("utf-8")).digest()).rstrip(b"==").decode("ascii")
 def uhash(s): return min([shash(s), quote_plus(s.removeprefix("https://"))], key=len)
 def header():
@@ -275,6 +277,21 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	os.replace(fn, filename)
 	update_progress(ctx, force=True, use_original_timestamp=True)
 parallel_request = shatter_request
+
+async def resolve_file(obj):
+	import pathlib
+	if isinstance(obj, (str, pathlib.Path)):
+		if not is_url(obj):
+			return open(obj, "rb+")
+		import tempfile
+		file = tempfile.NamedTemporaryFile()
+		await shatter_request(obj, filanem=file.name)
+		return file
+	import tempfile
+	file = tempfile.NamedTemporaryFile()
+	file.write(obj)
+	file.seek(0)
+	return file
 
 try:
 	from importlib.metadata import version
