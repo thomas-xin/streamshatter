@@ -10,15 +10,15 @@ import time
 from urllib.parse import quote_plus
 import niquests
 
-chunk_size = 1048576
+chunk_size = 262144
 base_chunk = 16384
 COLOURS = ["\x1b[38;5;16m█"]
 COLOURS.extend(f"\x1b[38;5;{i}m█" for i in range(232, 256))
 COLOURS.append("\x1b[38;5;15m█")
 
 session = None
-def generate_session():
-	globals()["session"] = niquests.AsyncSession(multiplexed=True)
+def generate_session(multiplexed=True):
+	globals()["session"] = niquests.AsyncSession(multiplexed=multiplexed)
 	return session
 generate_session()
 def is_url(url):
@@ -126,6 +126,8 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	file = os.path.join(ctx["cache_folder"], nth_file(uhash(url), start))
 	ctx["chunkinfo"].append(chunk)
 	attempts = 0
+	if not session.multiplexed and ctx["multiplexed"]:
+		generate_session()
 	with open(file, "wb+") as f:
 		while True:
 			timeout = (attempts + 1) * 5
@@ -155,7 +157,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 							dt = max(0.001, ct - ctx["start"])
 							ctx["last_bps"] = sum(d[1] for d in ctx["deltas"]) * 8 / min(5, dt)
 							ctx["last_split"] = time.perf_counter()
-							offset = round((chunk[-1] + size) / 2)
+							offset = chunk[-1] + round((size - chunk[-1]) / (2 if start else 64))
 							chunk2 = [start + offset, size - offset, 0]
 							rheaders = headers.copy()
 							rheaders["Priority"] = "i"
@@ -178,7 +180,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 				chunk[-1] = -0.01
 				# If a simple error occurs (e.g. timeout) but some data was already received, create a new request and end the current one
 				if offset > 0:
-					generate_session()
+					generate_session(ctx["multiplexed"])
 					if offset < size:
 						chunk2 = [start + offset, size - offset, 0]
 						rheaders = headers.copy()
@@ -212,7 +214,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 			update_progress(ctx, force=True)
 			await asyncio.sleep((attempts + random.random()) ** 2 + 1)
 			attempts += 1
-			generate_session()
+			generate_session(ctx["multiplexed"])
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
@@ -220,7 +222,13 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
-	resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify)
+	multiplexed = True
+	try:
+		resp = await asyncio.wait_for(session.request(method, url, headers=head, data=data, stream=True, verify=verify, timeout=3), timeout=4)
+	except (asyncio.TimeoutError, niquests.exceptions.ConnectTimeout, niquests.exceptions.MultiplexingError):
+		generate_session(False)
+		resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify, timeout=None)
+		multiplexed = False
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
 	if not filename:
@@ -246,11 +254,12 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		last=0,
 		size=size,
 		last_bps=0,
-		last_split=time.perf_counter(),
+		last_split=time.perf_counter() - 0.5,
 		cache_folder=cache_folder,
 		limit=limit,
 		verify=verify,
 		forkable=not single,
+		multiplexed=multiplexed,
 		allow_range_ends=True,
 		deltas=[],
 		chunkinfo=[],
