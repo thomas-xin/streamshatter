@@ -5,7 +5,6 @@ import json
 from math import isfinite
 import os
 import random
-import re
 import time
 from urllib.parse import quote_plus
 import niquests
@@ -147,7 +146,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 						except AttributeError:
 							raise TimeoutError
 						f.write(content)
-						chunk[-1] = min(max(len(content), chunk[-1] + len(content)), size)
+						chunk[-1] = min(max(len(content), chunk[-1] + len(content)), size) if size >= 0 else chunk[-1] + len(content)
 						ctx["deltas"].append((time.perf_counter(), len(content)))
 						split = update_progress(ctx)
 						if chunk[-1] == size:
@@ -232,7 +231,9 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
 	if not filename:
-		filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip() or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0].strip('"').strip("'"))
+		filename = resp.headers.get("attachment-filename") or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].strip().strip('"').strip("'") or url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+		import re
+		filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", filename)
 		if "." not in filename:
 			ctype = resp.headers.get("content-type")
 			if ctype and ctype != "application/octet-stream":
