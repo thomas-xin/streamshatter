@@ -271,8 +271,8 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	ctx["workers"].append(fut)
 	fn = filename + "~"
 	import shutil
-	with open(fn, "ab") as f:
-		f.truncate(0)
+	with open(fn, "ab+") as f:
+		f.seek(0)
 		while ctx["workers"]:
 			# Important invariant: Newly bisected workers will always be after the original ones in the list
 			ctx["workers"].sort(key=lambda fut: fut.start)
@@ -283,6 +283,8 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 				os.remove(file)
 			except Exception:
 				pass
+		if size > 0:
+			f.truncate(size)
 	assert os.path.exists(fn) and (size < 0 or os.path.getsize(fn) == size), f"Expected {size} bytes, received {os.path.getsize(fn)}"
 	try:
 		os.replace(fn, filename)
@@ -290,8 +292,12 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		with open(fn, "rb") as f:
 			if not fileobj:
 				fileobj = open(filename, "wb")
+			fileobj.seek(0)
 			shutil.copyfileobj(f, fileobj)
-		os.remove(fn)
+		try:
+			os.remove(fn)
+		except PermissionError:
+			pass
 	update_progress(ctx, force=True, use_original_timestamp=True)
 parallel_request = shatter_request
 
