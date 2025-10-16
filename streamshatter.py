@@ -111,7 +111,7 @@ def update_progress(ctx, force=False, use_original_timestamp=False):
 	if ctx["forkable"] and chunk_count < ctx["limit"]:
 		mcc = ctx.get("max_chunk_count", 0)
 		ccc = chunk_count - completed
-		if ct - ctx["last_split"] > 1 and (bps > ctx["last_bps"] * 1.05 or ccc < mcc):
+		if ct - ctx["last_split"] > max(1, 2 ** (ccc - 1)) and (bps > ctx["last_bps"] * 1.05 or ccc < mcc):
 			# Allow no more than 4 stalled/errored requests at a time
 			if sum(chunk[-1] <= 0 for chunk in ctx["chunkinfo"]) < 4:
 				ctx["max_chunk_count"] = max(mcc, ccc + 1)
@@ -156,7 +156,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 							dt = max(0.001, ct - ctx["start"])
 							ctx["last_bps"] = sum(d[1] for d in ctx["deltas"]) * 8 / min(5, dt)
 							ctx["last_split"] = time.perf_counter()
-							offset = chunk[-1] + round((size - chunk[-1]) / (2 if start else 64))
+							offset = chunk[-1] + round((size - chunk[-1]) / (3 if start else 64))
 							chunk2 = [start + offset, size - offset, 0]
 							rheaders = headers.copy()
 							rheaders["Priority"] = "i"
@@ -193,10 +193,13 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 					break
 			except Exception as ex:
 				chunk[-1] = -0.01
-				print(repr(ex))
-				if ctx["debug"]:
-					print(resp.headers)
-					raise
+				if isinstance(ex, niquests.exceptions.MultiplexingError):
+					ctx["multiplexed"] = False
+				else:
+					print(repr(ex))
+					if ctx["debug"]:
+						print(resp.headers)
+						raise
 			else:
 				chunk[-1] = size
 				break
