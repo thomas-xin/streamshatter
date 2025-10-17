@@ -220,7 +220,7 @@ async def write_request(ctx, chunk, resp, url, method, headers, data, filename):
 	assert os.path.exists(file), f"Chunk `{file}` missing!"
 	return file
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, cache_folder="", limit=1024, verify=True, debug=False, log_progress=True):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, cache_folder="", limit=1024, verify=True, debug=False, log_progress=True, timeout=None):
 	t = time.perf_counter()
 	head = header()
 	head.update(headers)
@@ -229,7 +229,7 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		resp = await asyncio.wait_for(session.request(method, url, headers=head, data=data, stream=True, verify=verify, timeout=3), timeout=4)
 	except (asyncio.TimeoutError, niquests.exceptions.ConnectTimeout, niquests.exceptions.MultiplexingError):
 		generate_session(False)
-		resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify, timeout=None)
+		resp = await session.request(method, url, headers=head, data=data, stream=True, verify=verify, timeout=timeout)
 		multiplexed = False
 	await resp.iter_content(base_chunk * 4)
 	resp.raise_for_status()
@@ -336,6 +336,7 @@ def main():
 	parser.add_argument("-H", '--headers', help="HTTP headers, interpreted as JSON", required=False, default="{}")
 	parser.add_argument("-c", '--cache-folder', help="Folder to store temporary files", required=False, default=os.path.join(__file__.replace("\\", "/").rsplit("/", 1)[0], "cache"))
 	parser.add_argument("-l", '--limit', help="Limits the amount of chunks to download; defaults to 1024", type=int, required=False, default=1024)
+	parser.add_argument("-t", '--timeout', help="Limits the amount of time allowed for the initial request to succeed", type=float, required=False, default=60)
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
 	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
@@ -355,6 +356,7 @@ def main():
 		verify=args.ssl,
 		debug=args.debug,
 		log_progress=args.log_progress,
+		timeout=args.timeout,
 	))
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ StreamShatter takes advantage of the `Range` HTTP header to dynamically allocate
 
 ## Usage
 ```
-usage: streamshatter [-h] [-V] [-H HEADERS] [-c CACHE_FOLDER] [-l LIMIT] [-s | --ssl | --no-ssl]
+usage: streamshatter [-h] [-V] [-H HEADERS] [-c CACHE_FOLDER] [-l LIMIT] [-t TIMEOUT] [-s | --ssl | --no-ssl]
                      [-d | --debug | --no-debug] [-lp | --log-progress | --no-log-progress]
                      url [filename]
 
@@ -33,10 +33,12 @@ options:
   -c, --cache-folder CACHE_FOLDER
                         Folder to store temporary files
   -l, --limit LIMIT     Limits the amount of chunks to download; defaults to 1024
+  -t, --timeout TIMEOUT
+                        Limits the amount of time allowed for the initial request to succeed
   -s, --ssl, --no-ssl   Enforces SSL verification; defaults to TRUE
   -d, --debug, --no-debug
                         Terminates immediately upon non-timeout errors, and writes the response data for errored
                         chunks; defaults to FALSE
   -lp, --log-progress, --no-log-progress
-                        Continually updates a progress bar in the standard output; defaults to TRUE
+                        Continually updates a progress bar in the standard output; defaults to TRU
 ```
