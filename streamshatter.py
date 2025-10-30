@@ -25,7 +25,6 @@ def generate_session(multiplexed=True):
 		pool_maxsize=16,
 		happy_eyeballs=True,
 	)
-
 def header():
 	return {
 		"Accept": "*/*",
@@ -580,7 +579,6 @@ def main():
 	)
 	parser.add_argument("-V", '--version', action='version', version=f'%(prog)s {__version__}')
 	parser.add_argument("-H", '--headers', help="HTTP headers, interpreted as JSON", required=False, default="{}")
-	parser.add_argument("-c", '--cache-folder', help="Folder to store temporary files", required=False, default=os.path.join(__file__.replace("\\", "/").rsplit("/", 1)[0], "cache"))
 	parser.add_argument("-l", "-cl", '--concurrent-limit', help="Limits the amount of concurrent requests; defaults to 64", type=int, required=False, default=64)
 	parser.add_argument("-sl", '--size-limit', help="Limits the amount of data to download; defaults to 1099511627776", type=int, required=False, default=1099511627776)
 	parser.add_argument("-t", '--timeout', help="Limits the amount of time allowed for the initial request to succeed", type=float, required=False, default=60)
@@ -590,8 +588,6 @@ def main():
 	parser.add_argument("url", help="Target URL")
 	parser.add_argument("filename", help='Output filename; use "-" for stdout pipe', nargs="?", default="")
 	args = parser.parse_args()
-	if not os.path.exists(args.cache_folder):
-		os.mkdir(args.cache_folder)
 	if os.name == "nt":
 		os.system("color")
 	ctx = ChunkManager(
