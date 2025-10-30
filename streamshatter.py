@@ -31,7 +31,7 @@ def header():
 		"Accept": "*/*",
 		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0 AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36 Edg/134.0.3124.85",
 		"DNT": "1",
-		"X-Forwarded-For": ".".join(str(random.randint(0, 255)) for _ in range(4)),
+		"X-Forwarded-For": "34." + ".".join(str(random.randint(1, 254)) for _ in range(3)),
 	}
 def box(i):
 	if i < 0:
@@ -249,7 +249,7 @@ class ChunkManager:
 			if len(remaining) >= self.concurrent_limit:
 				continue
 			bps_ratio = self.bps / self.max_bps
-			multiplier = ((self.size - self.progress) / self.size) ** 2
+			multiplier = ((self.size - self.progress) / self.size)
 			try:
 				multiplier /= bps_ratio
 			except ZeroDivisionError:
