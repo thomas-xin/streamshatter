@@ -171,7 +171,7 @@ class ChunkManager:
 		s = "\033[K" + "".join(samples)
 		dt = max(0.001, ct - self.timestamp)
 		timer = time_disp(dt)
-		progress = self.progress / self.size
+		progress = 1 if self.done else self.progress / self.size if self.size > 0 else 0
 		percentage = round(progress * 100, 4)
 		if percentage.is_integer():
 			percentage = int(percentage)
@@ -233,11 +233,12 @@ class ChunkManager:
 				for session in self.sessions:
 					await session.close()
 				self.update_progress(force=True)
-				print()
+				if self.log_progress:
+					print()
 		return fp if is_stream else open(self.filename, "rb")
 
 	async def shatter(self):
-		if not self.concurrent_limit:
+		if not self.concurrent_limit or self.size <= 0:
 			return
 		worker = self.workers[0]
 		while self.workers:
