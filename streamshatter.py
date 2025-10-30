@@ -157,8 +157,10 @@ class ChunkManager:
 		return resp, it
 
 	def update_progress(self, force=False):
+		if not self.log_progress:
+			return
 		ct = time.perf_counter()
-		if not force and (ct - self.last_update < 0.03 or not self.log_progress):
+		if not force and ct - self.last_update < 0.03:
 			return
 		self.last_update = ct
 		maxbar = 64
@@ -255,8 +257,9 @@ class ChunkManager:
 			remaining.sort(key=lambda worker: worker.split_priority(multiplier))
 			worker = remaining[-1]
 			if worker.split_priority(multiplier) <= 0:
-				if worker.bps / self.max_single_bps < 0.125 and time.perf_counter() - worker.timestamp > 5:
+				if bps_ratio < 0.125 and worker.bps / self.max_single_bps < 0.5 and time.perf_counter() - worker.timestamp > worker.restart_cooldown:
 					worker.needs_restart = True
+					worker.restart_cooldown *= 2
 				continue
 			avg_bps = sum(worker.bps for worker in remaining) / len(remaining)
 			ratio = max(1 / 64, min(1 / 2, worker.bps / (avg_bps + worker.bps)))
@@ -349,6 +352,7 @@ class ChunkWorker:
 		self.done = False
 		self.error = None
 		self.needs_restart = False
+		self.restart_cooldown = 5
 		self.is_target = False
 
 	async def refresh_resp(self, attempt=0, timeout=None):
