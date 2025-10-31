@@ -106,6 +106,8 @@ class ChunkManager:
 		self.request_count = 0
 		self.max_bps = 0
 		self.max_single_bps = 0
+		self.response_headers = {}
+		self.status_code = 0
 
 	async def probe_request(self):
 		self.session = session = generate_session(self.multiplexed)
@@ -151,6 +153,8 @@ class ChunkManager:
 				ait = asyncio.wait_for(ait, timeout=self.timeout)
 			it = await ait
 		self.verify = verify
+		self.status_code = resp.status_code
+		self.response_headers.update(resp.headers)
 		resp.raise_for_status()
 		self.latency = time.perf_counter() - t
 		return resp, it
@@ -547,7 +551,7 @@ class ChunkWorker:
 		return not self.done
 
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=1024, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=1024, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -562,7 +566,10 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		log_progress=log_progress,
 		timeout=timeout,
 	)
-	return ctx.start()
+	resp = await ctx.start()
+	if return_headers:
+		return resp, ctx.response_headers
+	return resp
 parallel_request = shatter_request
 
 
@@ -602,7 +609,7 @@ def main():
 		log_progress=args.log_progress,
 		timeout=args.timeout,
 	)
-	ctx.run()
+	ctx.run().close()
 
 if __name__ == "__main__":
 	main()
