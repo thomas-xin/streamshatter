@@ -1,3 +1,6 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
 import asyncio
 import concurrent.futures
 import itertools
@@ -188,6 +191,7 @@ class ChunkManager:
 		return progress
 
 	async def join(self):
+		self.workers[0].do(stream=True)
 		fut = asyncio.create_task(self.shatter())
 		is_stream = self.fileobj is not None
 		if is_stream:
@@ -211,7 +215,7 @@ class ChunkManager:
 					worker = self.workers[index]
 					worker.is_target = True
 					stream = index == 0
-					fc = worker.do(stream=stream)
+					fc = worker.do()
 					if stream:
 						async for b in fc:
 							await asyncio.get_event_loop().run_in_executor(executor, fp.write, b)
@@ -252,7 +256,7 @@ class ChunkManager:
 				break
 			if len(remaining) >= self.concurrent_limit:
 				continue
-			bps_ratio = self.bps / self.max_bps
+			bps_ratio = self.bps / max(self.max_bps, 1)
 			multiplier = ((self.size - self.progress) / self.size)
 			try:
 				multiplier /= bps_ratio
@@ -261,7 +265,7 @@ class ChunkManager:
 			remaining.sort(key=lambda worker: worker.split_priority(multiplier))
 			worker = remaining[-1]
 			if worker.split_priority(multiplier) <= 0:
-				if bps_ratio < 0.125 and worker.bps / self.max_single_bps < 0.5 and time.perf_counter() - worker.timestamp > worker.restart_cooldown:
+				if bps_ratio < 0.125 and worker.bps / max(1, self.max_single_bps) < 0.5 and time.perf_counter() - worker.timestamp > worker.restart_cooldown:
 					worker.needs_restart = True
 					worker.restart_cooldown *= 2
 				continue
@@ -300,7 +304,11 @@ class ChunkManager:
 			self.size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
 		except (KeyError, ValueError):
 			self.size = 0
-		if self.size <= 0 or "bytes" not in resp.headers.get("accept-ranges", "").lower():
+		if (
+			self.size <= 0
+			or "bytes" not in resp.headers.get("accept-ranges", "").lower()
+			or resp.headers.get("content-encoding") not in (None, "identity")
+		):
 			self.concurrent_limit = 0
 		worker = ChunkWorker(
 			ctx=self,
@@ -452,7 +460,8 @@ class ChunkWorker:
 							raise AttributeError
 				except (StopIteration, StopAsyncIteration):
 					pass
-				break
+				if self.remainder <= 0:
+					break
 			except (
 				TimeoutError,
 				asyncio.TimeoutError,
@@ -469,7 +478,7 @@ class ChunkWorker:
 			except niquests.HTTPError as ex:
 				if ex.response.status_code == 416:
 					ctx.allow_range_ends = False
-				elif ex.response.status_code not in (408, 420, 429, 502, 503, 504, 509, 522, 599):
+				elif ex.response.status_code not in (408, 420, 425, 429, 460, 502, 503, 504, 508, 509, 522, 524, 529, 599):
 					raise
 				if ctx.debug:
 					print(repr(ex))
@@ -551,7 +560,7 @@ class ChunkWorker:
 		return not self.done
 
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=1024, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, return_headers=False):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
