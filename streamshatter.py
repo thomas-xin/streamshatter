@@ -549,6 +549,13 @@ class ChunkWorker:
 		return self.range.stop - self.range.start - self.pos
 	@property
 	def bps(self):
+		if len(self.recv_times) >= 128 and not len(self.recv_times) & 1:
+			recv_times = []
+			for i in range(0, len(self.recv_times), 2):
+				t1, n1 = self.recv_times[i]
+				t2, n2 = self.recv_times[i + 1]
+				recv_times.append((t1, n1 + n2))
+			self.recv_times = recv_times
 		t = time.perf_counter()
 		while self.recv_times and t > self.recv_times[0][0] + 5:
 			self.recv_times.pop(0)
