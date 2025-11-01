@@ -117,10 +117,12 @@ class ChunkManager:
 		self.sessions.add(session)
 		verify = self.verify if self.verify is not None else True
 		t = time.perf_counter()
+		probe_headers = dict(self.headers)
+		probe_headers["Range"] = "bytes=0-"
 		req = session.request(
 			self.method,
 			self.url,
-			headers=self.headers,
+			headers=probe_headers,
 			data=self.data,
 			stream=True,
 			verify=verify,
@@ -133,7 +135,8 @@ class ChunkManager:
 			if self.timeout:
 				ait = asyncio.wait_for(ait, timeout=self.timeout)
 			it = await ait
-		except (asyncio.TimeoutError, niquests.exceptions.ConnectTimeout, niquests.exceptions.MultiplexingError):
+			assert resp.status_code != 416
+		except (AssertionError, asyncio.TimeoutError, niquests.exceptions.ConnectTimeout, niquests.exceptions.MultiplexingError):
 			self.multiplexed = False
 			self.session = session = generate_session(self.multiplexed)
 			self.sessions.add(session)
@@ -192,7 +195,7 @@ class ChunkManager:
 
 	async def join(self):
 		self.workers[0].do(stream=True)
-		fut = asyncio.create_task(self.shatter())
+		shattering = asyncio.create_task(self.shatter())
 		is_stream = self.fileobj is not None
 		if is_stream:
 			fp = self.fileobj
@@ -234,7 +237,7 @@ class ChunkManager:
 					asize = os.path.exists(self.filename) and os.path.getsize(self.filename)
 					assert self.size <= 0 or asize == self.size, f"Expected {self.size} bytes, received {asize}"
 			finally:
-				fut.cancel()
+				shattering.cancel()
 				if not is_stream and os.path.exists(fp.name):
 					fp.close()
 					os.remove(fp.name)
@@ -306,7 +309,7 @@ class ChunkManager:
 			self.size = 0
 		if (
 			self.size <= 0
-			or "bytes" not in resp.headers.get("accept-ranges", "").lower()
+			or "content-range" not in resp.headers and "bytes" not in resp.headers.get("accept-ranges", "").lower()
 			or resp.headers.get("content-encoding") not in (None, "identity")
 		):
 			self.concurrent_limit = 0
@@ -602,9 +605,11 @@ def main():
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
 	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
-	parser.add_argument("url", help="Target URL")
+	parser.add_argument("url", help="Target URL", nargs="?", default="")
 	parser.add_argument("filename", help='Output filename; use "-" for stdout pipe', nargs="?", default="")
 	args = parser.parse_args()
+	if not args.url:
+		args.url = input("Please use `streamshatter -h` for help, or input a URL to download directly: ").strip()
 	if os.name == "nt":
 		os.system("color")
 	ctx = ChunkManager(
