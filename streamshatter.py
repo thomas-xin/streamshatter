@@ -13,7 +13,6 @@ import sys
 import tempfile
 import time
 import niquests
-import urllib3
 
 MIN_SPLIT = 262144
 CHUNK_SIZE = 16384
@@ -85,7 +84,7 @@ def sample(arr, n):
 
 class ChunkManager:
 
-	def __init__(self, url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None):
+	def __init__(self, url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf):
 		self.url = url
 		self.method = method
 		self.headers = header()
@@ -99,6 +98,7 @@ class ChunkManager:
 		self.debug = debug
 		self.log_progress = log_progress
 		self.timeout = timeout
+		self.max_attempts = max_attempts
 		self.multiplexed = self.concurrent_limit > 1
 		self.allow_range_ends = True
 		self.timestamp = 0
@@ -115,55 +115,78 @@ class ChunkManager:
 	async def probe_request(self):
 		self.session = session = generate_session(self.multiplexed)
 		self.sessions.add(session)
-		verify = self.verify if self.verify is not None else True
-		t = time.perf_counter()
-		probe_headers = dict(self.headers)
-		probe_headers["Range"] = "bytes=0-"
-		req = session.request(
-			self.method,
-			self.url,
-			headers=probe_headers,
-			data=self.data,
-			stream=True,
-			verify=verify,
-			timeout=min(3, self.timeout or 3),
-		)
+		resp = None
+		it = None
 		try:
-			self.request_count += 1
-			resp = await asyncio.wait_for(req, timeout=4)
-			ait = resp.iter_content(CHUNK_SIZE)
-			if self.timeout:
-				ait = asyncio.wait_for(ait, timeout=self.timeout)
-			it = await ait
-			assert resp.status_code != 416
-		except (AssertionError, asyncio.TimeoutError, niquests.exceptions.ConnectTimeout, niquests.exceptions.MultiplexingError):
-			self.multiplexed = False
-			self.session = session = generate_session(self.multiplexed)
-			self.sessions.add(session)
-			verify = self.verify or False
+			verify = self.verify if self.verify is not None else True
+			t = time.perf_counter()
+			probe_headers = dict(self.headers)
+			probe_headers["Range"] = "bytes=0-"
 			req = session.request(
 				self.method,
 				self.url,
-				headers=self.headers,
+				headers=probe_headers,
 				data=self.data,
 				stream=True,
 				verify=verify,
-				timeout=self.timeout,
+				timeout=min(3, self.timeout or 3),
 			)
-			if self.timeout:
-				req = asyncio.wait_for(req, timeout=self.timeout + 1)
-			self.request_count += 1
-			resp = await req
-			ait = resp.iter_content(CHUNK_SIZE)
-			if self.timeout:
-				ait = asyncio.wait_for(ait, timeout=self.timeout)
-			it = await ait
-		self.verify = verify
-		self.status_code = resp.status_code
-		self.response_headers.update(resp.headers)
-		resp.raise_for_status()
-		self.latency = time.perf_counter() - t
-		return resp, it
+			resp = None
+			try:
+				self.request_count += 1
+				resp = await asyncio.wait_for(req, timeout=4)
+				ait = resp.iter_content(CHUNK_SIZE)
+				if self.timeout:
+					ait = asyncio.wait_for(ait, timeout=self.timeout)
+				it = await ait
+				assert resp.status_code != 416
+			except (
+				AssertionError,
+				TimeoutError,
+				asyncio.TimeoutError,
+				niquests.ConnectionError,
+				niquests.ConnectTimeout,
+				niquests.ReadTimeout,
+				niquests.Timeout,
+				niquests.exceptions.ChunkedEncodingError,
+				AttributeError,
+			):
+				if resp is not None:
+					if it is not None:
+						await it.aclose()
+					await resp.close()
+				self.multiplexed = False
+				self.session = session = generate_session(self.multiplexed)
+				self.sessions.add(session)
+				verify = self.verify or False
+				req = session.request(
+					self.method,
+					self.url,
+					headers=self.headers,
+					data=self.data,
+					stream=True,
+					verify=verify,
+					timeout=self.timeout,
+				)
+				if self.timeout:
+					req = asyncio.wait_for(req, timeout=self.timeout + 1)
+				self.request_count += 1
+				resp = await req
+				ait = resp.iter_content(CHUNK_SIZE)
+				if self.timeout:
+					ait = asyncio.wait_for(ait, timeout=self.timeout)
+				it = await ait
+			self.verify = verify
+			self.status_code = resp.status_code
+			self.response_headers.update(resp.headers)
+			resp.raise_for_status()
+			self.latency = time.perf_counter() - t
+			return resp, it
+		except Exception:
+			if resp is not None:
+				await resp.close()
+			await self.aclose()
+			raise
 
 	def update_progress(self, force=False):
 		if not self.log_progress:
@@ -193,9 +216,11 @@ class ChunkManager:
 		print(s, end="\r")
 		return progress
 
-	async def join(self):
+	async def join(self, close=False):
+		futs = []
 		self.workers[0].do(stream=True)
 		shattering = asyncio.create_task(self.shatter())
+		futs.append(shattering)
 		is_stream = self.fileobj is not None
 		if is_stream:
 			fp = self.fileobj
@@ -223,6 +248,7 @@ class ChunkManager:
 						async for b in fc:
 							await asyncio.get_event_loop().run_in_executor(executor, fp.write, b)
 					else:
+						futs.append(fc)
 						fc = await fc
 						with fc:
 							await asyncio.get_event_loop().run_in_executor(executor, shutil.copyfileobj, fc, fp)
@@ -237,15 +263,18 @@ class ChunkManager:
 					asize = os.path.exists(self.filename) and os.path.getsize(self.filename)
 					assert self.size <= 0 or asize == self.size, f"Expected {self.size} bytes, received {asize}"
 			finally:
-				shattering.cancel()
+				while futs:
+					await asyncio.wait_for(futs.pop(0), timeout=1)
 				if not is_stream and os.path.exists(fp.name):
 					fp.close()
 					os.remove(fp.name)
-				for session in self.sessions:
-					await session.close()
+				await self.aclose()
 				self.update_progress(force=True)
-				if self.log_progress:
-					print()
+		if close:
+			if is_stream:
+				fp.close()
+				return fp.name
+			return self.filename
 		return fp if is_stream else open(self.filename, "rb")
 
 	async def shatter(self):
@@ -276,7 +305,7 @@ class ChunkManager:
 			ratio = max(1 / 64, min(1 / 2, worker.bps / (avg_bps + worker.bps)))
 			worker.split(ratio)
 
-	async def start(self):
+	async def start(self, close=False):
 		self.timestamp = time.perf_counter()
 		resp, it = await self.probe_request()
 		if not self.filename or self.filename.replace("\\", "/").endswith("/"):
@@ -320,10 +349,20 @@ class ChunkManager:
 			url=resp.url,
 		)
 		self.workers.append(worker)
-		return await self.join()
+		return await self.join(close=close)
 
-	def run(self):
-		return asyncio.run(self.start())
+	def run(self, close=False, return_headers=False):
+		# import selectors
+		# loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
+		loop = asyncio.new_event_loop()
+		resp = loop.run_until_complete(self.start(close=close))
+		if return_headers:
+			return resp, self.response_headers
+		return resp
+
+	async def aclose(self):
+		for session in self.sessions:
+			await session.close()
 
 	@property
 	def done(self):
@@ -379,9 +418,9 @@ class ChunkWorker:
 			if attempt > 1 or not ctx.request_count & 15:
 				self.url = ctx.url
 				ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
+				self.sessions.add(session)
 			else:
 				session = ctx.session
-			ctx.sessions.add(session)
 			headers = self.headers.copy()
 			headers["Priority"] = "i"
 			if ctx.allow_range_ends:
@@ -489,12 +528,13 @@ class ChunkWorker:
 				await asyncio.sleep(2 ** attempt)
 			finally:
 				if self.resp is not None:
-					try:
-						await asyncio.wait_for(self.resp.close(), timeout=delay)
-					except (asyncio.TimeoutError, urllib3.exceptions.ResponseNotReady):
-						pass
+					if self.it is not None:
+						await self.it.aclose()
+					await self.resp.close()
 					self.resp = None
 				ctx.update_progress(force=True)
+			if attempt + 1 >= ctx.max_attempts:
+				raise asyncio.CancelledError("Maximum attempts exceeded for worker.")
 			sleep = delay + t - time.perf_counter()
 			if sleep > 0:
 				await asyncio.sleep(sleep)
@@ -570,7 +610,7 @@ class ChunkWorker:
 		return not self.done
 
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, return_headers=False):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -584,6 +624,7 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		debug=debug,
 		log_progress=log_progress,
 		timeout=timeout,
+		max_attempts=max_attempts,
 	)
 	resp = await ctx.start()
 	if return_headers:
@@ -609,6 +650,7 @@ def main():
 	parser.add_argument("-l", "-cl", '--concurrent-limit', help="Limits the amount of concurrent requests; defaults to 64", type=int, required=False, default=64)
 	parser.add_argument("-sl", '--size-limit', help="Limits the amount of data to download; defaults to 1099511627776", type=int, required=False, default=1099511627776)
 	parser.add_argument("-t", '--timeout', help="Limits the amount of time allowed for the initial request to succeed", type=float, required=False, default=60)
+	parser.add_argument("-ma", '--max-attempts', help="Limits the amount of retries allowed for each request", type=float, required=False, default=inf)
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
 	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
@@ -629,6 +671,7 @@ def main():
 		debug=args.debug,
 		log_progress=args.log_progress,
 		timeout=args.timeout,
+		max_attempts=args.max_attempts,
 	)
 	ctx.run().close()
 
