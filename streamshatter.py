@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import collections.abc
 import concurrent.futures
+import io
 import itertools
 import json
 from math import isfinite, inf
@@ -84,7 +86,7 @@ def sample(arr, n):
 
 class ChunkManager:
 
-	def __init__(self, url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf):
+	def __init__(self, url: str, method: str = "get", headers: dict = {}, data: bytes | None = None, filename: str | None = None, fileobj: io.BufferedReader | None = None, concurrent_limit: int = 64, size_limit: int = 1099511627776, verify: bool | None = None, debug: bool = False, log_progress: bool = True, timeout: float | None = None, max_attempts: float = inf):
 		self.url = url
 		self.method = method
 		self.headers = header()
@@ -112,7 +114,7 @@ class ChunkManager:
 		self.response_headers = {}
 		self.status_code = 0
 
-	async def probe_request(self):
+	async def probe_request(self) -> tuple:
 		self.session = session = generate_session(self.multiplexed)
 		self.sessions.add(session)
 		resp = None
@@ -148,6 +150,7 @@ class ChunkManager:
 				niquests.ConnectTimeout,
 				niquests.ReadTimeout,
 				niquests.Timeout,
+				niquests.exceptions.MultiplexingError,
 				niquests.exceptions.ChunkedEncodingError,
 				AttributeError,
 			):
@@ -188,7 +191,7 @@ class ChunkManager:
 			await self.aclose()
 			raise
 
-	def update_progress(self, force=False):
+	def update_progress(self, force=False) -> float | None:
 		if not self.log_progress:
 			return
 		ct = time.perf_counter()
@@ -216,19 +219,21 @@ class ChunkManager:
 		print(s, end="\r")
 		return progress
 
-	async def join(self, close=False):
+	async def join(self, close=False) -> io.BufferedIOBase | str:
 		futs = []
 		self.workers[0].do(stream=True)
 		shattering = asyncio.create_task(self.shatter())
 		futs.append(shattering)
-		is_stream = self.fileobj is not None
-		if is_stream:
+		if self.fileobj is not None:
 			fp = self.fileobj
+			is_stream = True
 		else:
-			disk = os.path.splitdrive(self.filename)[0]
+			disk = os.path.splitdrive(self.filename or ".")[0]
 			folder = disk + "/.temp"
 			os.makedirs(folder, exist_ok=True)
 			fp = tempfile.NamedTemporaryFile(dir=folder, delete=False)
+			is_stream = False
+		assert isinstance(fp, (io.BufferedWriter, tempfile._TemporaryFileWrapper))
 		with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
 			try:
 				try:
@@ -256,6 +261,7 @@ class ChunkManager:
 					index += 1
 				if not is_stream:
 					fp.close()
+					assert self.filename
 					try:
 						os.replace(fp.name, self.filename)
 					except (PermissionError, OSError):
@@ -274,8 +280,12 @@ class ChunkManager:
 			if is_stream:
 				fp.close()
 				return fp.name
+			assert self.filename
 			return self.filename
-		return fp if is_stream else open(self.filename, "rb")
+		if is_stream:
+			return fp
+		assert self.filename
+		return open(self.filename, "rb")
 
 	async def shatter(self):
 		if not self.concurrent_limit or self.size <= 0:
@@ -305,7 +315,7 @@ class ChunkManager:
 			ratio = max(1 / 64, min(1 / 2, worker.bps / (avg_bps + worker.bps)))
 			worker.split(ratio)
 
-	async def start(self, close=False):
+	async def start(self, close=False) -> io.BufferedIOBase | str:
 		self.timestamp = time.perf_counter()
 		resp, it = await self.probe_request()
 		if not self.filename or self.filename.replace("\\", "/").endswith("/"):
@@ -314,7 +324,7 @@ class ChunkManager:
 				os.makedirs(path, exist_ok=True)
 			else:
 				path = os.path.abspath(os.curdir)
-			filename = (
+			filename: str = (
 				resp.headers.get("attachment-filename")
 				or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].lstrip('"').split('"', 1)[0].strip().strip('"').strip("'")
 				or self.url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
@@ -330,7 +340,7 @@ class ChunkManager:
 						filename = filename + "." + ext
 			self.filename = os.path.join(path, filename)
 		elif not self.fileobj and self.filename == "-":
-			self.fileobj = sys.__stdout__.buffer
+			self.fileobj = (sys.__stdout__ or sys.stdout).buffer
 			sys.stdout = sys.stderr
 		try:
 			self.size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
@@ -386,12 +396,14 @@ _range = range
 
 class ChunkWorker:
 
-	def __init__(self, ctx: ChunkManager, range=None, resp=None, it=None, url=None):
+	def __init__(self, ctx: ChunkManager, range: _range | None = None, resp: niquests.AsyncResponse | None = None, it: collections.abc.AsyncGenerator | None = None, url: str | None = None):
 		self.ctx = ctx
 		self.running = None
 		headers = ctx.headers
 		if range is None:
-			range = _range(0, min(ctx.size or inf, ctx.size_limit))
+			n = min(ctx.size or inf, ctx.size_limit)
+			assert isinstance(n, int)
+			range = _range(0, n)
 		self.range = range
 		self.resp = resp
 		self.it = it
@@ -409,7 +421,7 @@ class ChunkWorker:
 		self.restart_cooldown = 5
 		self.is_target = False
 
-	async def refresh_resp(self, attempt=0, timeout=None):
+	async def refresh_resp(self, attempt=0, timeout=None) -> niquests.AsyncResponse:
 		if self.resp is None:
 			ctx = self.ctx
 			self.timestamp = time.perf_counter()
@@ -418,7 +430,7 @@ class ChunkWorker:
 			if attempt > 1 or not ctx.request_count & 15:
 				self.url = ctx.url
 				ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
-				self.sessions.add(session)
+				ctx.sessions.add(session)
 			else:
 				session = ctx.session
 			headers = self.headers.copy()
@@ -479,6 +491,7 @@ class ChunkWorker:
 			t = time.perf_counter()
 			try:
 				await self.refresh_resp(attempt=attempt, timeout=timeout)
+				assert self.it is not None
 				try:
 					while True:
 						t = time.perf_counter()
@@ -518,6 +531,7 @@ class ChunkWorker:
 					print(repr(ex))
 				self.error = ex
 			except niquests.HTTPError as ex:
+				assert ex.response
 				if ex.response.status_code == 416:
 					ctx.allow_range_ends = False
 				elif ex.response.status_code not in (408, 420, 425, 429, 460, 502, 503, 504, 508, 509, 522, 524, 529, 599):
@@ -534,12 +548,12 @@ class ChunkWorker:
 					self.resp = None
 				ctx.update_progress(force=True)
 			if attempt + 1 >= ctx.max_attempts:
-				raise asyncio.CancelledError("Maximum attempts exceeded for worker.")
+				raise TimeoutError("Maximum attempts exceeded for worker.")
 			sleep = delay + t - time.perf_counter()
 			if sleep > 0:
 				await asyncio.sleep(sleep)
 
-	async def run(self):
+	async def run(self) -> tempfile.SpooledTemporaryFile:
 		self.fp = tempfile.SpooledTemporaryFile(max_size=12 * 1048576)
 		async for b in self.stream():
 			self.fp.write(b)
@@ -547,7 +561,7 @@ class ChunkWorker:
 		self.fp.seek(0)
 		return self.fp
 
-	def do(self, stream=False):
+	def do(self, stream=False) -> collections.abc.Awaitable:
 		if self.running:
 			return self.running
 		if stream:
@@ -558,7 +572,7 @@ class ChunkWorker:
 			self.running = asyncio.create_task(fut)
 		return self.running
 
-	def split_priority(self, multiplier=1):
+	def split_priority(self, multiplier=1) -> float:
 		if self.error or self.size <= MIN_SPLIT:
 			return 0
 		ctx = self.ctx
@@ -632,6 +646,27 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	return resp
 parallel_request = shatter_request
 
+def download(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, return_headers=False):
+	ctx = ChunkManager(
+		url=url,
+		method=method,
+		headers=headers,
+		data=data,
+		filename=filename,
+		fileobj=fileobj,
+		concurrent_limit=concurrent_limit,
+		size_limit=size_limit,
+		verify=verify,
+		debug=debug,
+		log_progress=log_progress,
+		timeout=timeout,
+		max_attempts=max_attempts,
+	)
+	resp = ctx.run()
+	if return_headers:
+		return resp, ctx.response_headers
+	return resp
+
 
 try:
 	from importlib.metadata import version
@@ -661,7 +696,7 @@ def main():
 		args.url = input("Please use `streamshatter -h` for help, or input a URL to download directly: ").strip()
 	if os.name == "nt":
 		os.system("color")
-	ctx = ChunkManager(
+	download(
 		url=args.url,
 		headers=json.loads(args.headers),
 		filename=args.filename,
@@ -673,7 +708,6 @@ def main():
 		timeout=args.timeout,
 		max_attempts=args.max_attempts,
 	)
-	ctx.run().close()
 
 if __name__ == "__main__":
 	main()
