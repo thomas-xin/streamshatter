@@ -39,7 +39,7 @@ def header():
 def box(i):
 	if i < 0:
 		return "\x1b[38;5;196m█"
-	elif i > 1:
+	elif not i <= 1:
 		return "\x1b[38;5;46m█"
 	return COLOURS[round(i * (len(COLOURS) - 1))]
 def time_disp(s, rounded=True):
@@ -199,7 +199,7 @@ class ChunkManager:
 			return
 		self.last_update = ct
 		maxbar = 64
-		samples = [box(n) for n in sample([inf if worker.done else worker.pos / worker.size for worker in self.workers], maxbar)]
+		samples = [box(n) for n in sample([2 if worker.done else worker.pos / worker.size for worker in self.workers], maxbar)]
 		for i, worker in enumerate(self.workers):
 			if worker.error:
 				si = int(i / len(self.workers) * len(samples))
