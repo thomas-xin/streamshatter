@@ -123,7 +123,8 @@ class ChunkManager:
 			verify = self.verify if self.verify is not None else True
 			t = time.perf_counter()
 			probe_headers = dict(self.headers)
-			probe_headers["Range"] = "bytes=0-"
+			if self.allow_range_ends:
+				probe_headers["Range"] = "bytes=0-"
 			req = session.request(
 				self.method,
 				self.url,
@@ -351,7 +352,9 @@ class ChunkManager:
 			or "content-range" not in resp.headers and "bytes" not in resp.headers.get("accept-ranges", "").lower()
 			or resp.headers.get("content-encoding") not in (None, "identity")
 		):
+			self.size = 0
 			self.concurrent_limit = 0
+			self.allow_range_ends = False
 		worker = ChunkWorker(
 			ctx=self,
 			resp=resp,
@@ -515,7 +518,7 @@ class ChunkWorker:
 							raise AttributeError
 				except (StopIteration, StopAsyncIteration):
 					pass
-				if self.remainder <= 0:
+				if self.remainder <= 0 or not ctx.size:
 					break
 			except (
 				TimeoutError,
