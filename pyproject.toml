@@ -6,8 +6,8 @@ build-backend = "hatchling.build"
 name = "streamshatter"
 version = "1.2.0"
 dependencies = [
-    "niquests>=3.18.7",
-    "urllib3-future>=2.19.913",
+    "niquests>=3.19.1",
+    "urllib3-future>=2.21.902",
 ]
 description = "Multiplexed chunked file downloader"
 readme = "README.md"
