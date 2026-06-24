@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
+import subprocess
 import asyncio
 import collections.abc
 import concurrent.futures
@@ -14,7 +15,9 @@ import shutil
 import sys
 import tempfile
 import time
+from traceback import print_exc
 import niquests
+from niquests.structures import CaseInsensitiveDict
 
 MIN_SPLIT = 262144
 CHUNK_SIZE = 16384
@@ -22,12 +25,15 @@ COLOURS = ["\x1b[38;5;16m█"]
 COLOURS.extend(f"\x1b[38;5;{i}m█" for i in range(232, 256))
 COLOURS.append("\x1b[38;5;15m█")
 
+_range = range
+event_loops = set()
+
 def generate_session(multiplexed=True):
 	return niquests.AsyncSession(
 		multiplexed=multiplexed,
-		pool_connections=16,
-		pool_maxsize=16,
-		happy_eyeballs=True,
+		pool_connections=24,
+		pool_maxsize=24,
+		happy_eyeballs=multiplexed,
 	)
 def header():
 	return {
@@ -69,8 +75,7 @@ def calc_bps(bps):
 	for suffix in ("bps", "kbps", "Mbps", "Gbps", "Tbps", "Pbps", "Ebps", "Zbps", "Ybps"):
 		bps = round(bps, 4)
 		if bps < 1000:
-			if bps.is_integer():
-				bps = int(bps)
+			bps = "%8.4f" % bps
 			return f"{bps} {suffix}"
 		bps /= 1000
 	return "ERR"
@@ -83,10 +88,31 @@ def sample(arr, n):
 		return [arr[int(i)] * (1 - i % 1) + arr[int(i) + 1] * (i % 1) for i in indices]
 	return arr
 
+passable_exceptions = (
+	ConnectionResetError,
+	ConnectionAbortedError,
+	OSError,
+	TimeoutError,
+	asyncio.TimeoutError,
+	niquests.ConnectionError,
+	niquests.ConnectTimeout,
+	niquests.ReadTimeout,
+	niquests.Timeout,
+	niquests.exceptions.MultiplexingError,
+	niquests.exceptions.ChunkedEncodingError,
+	AttributeError,
+	AssertionError,
+)
+
+
+class MockObject:
+	def __init__(self, **kwargs):
+		self.__dict__.update(kwargs)
+
 
 class ChunkManager:
 
-	def __init__(self, url: str, method: str = "get", headers: dict = {}, data: bytes | None = None, filename: str | None = None, fileobj: io.BufferedReader | None = None, concurrent_limit: int = 64, size_limit: int = 1099511627776, verify: bool | None = None, debug: bool = False, log_progress: bool = True, timeout: float | None = None, max_attempts: float = inf):
+	def __init__(self, url: str, method: str = "get", headers: dict = {}, data: bytes | None = None, filename: str | None = None, fileobj: io.BufferedReader | None = None, concurrent_limit: int = 64, size_limit: int = 1099511627776, verify: bool | None = None, debug: bool = False, log_progress: bool = True, timeout: float | None = None, max_attempts: float = inf, multiplexed: bool = True, use_curl: bool = False):
 		self.url = url
 		self.method = method
 		self.headers = header()
@@ -101,7 +127,8 @@ class ChunkManager:
 		self.log_progress = log_progress
 		self.timeout = timeout
 		self.max_attempts = max_attempts
-		self.multiplexed = self.concurrent_limit > 1
+		self.multiplexed = multiplexed and self.concurrent_limit > 1
+		self.use_curl = use_curl
 		self.allow_range_ends = True
 		self.timestamp = 0
 		self.last_update = 0
@@ -111,7 +138,7 @@ class ChunkManager:
 		self.request_count = 0
 		self.max_bps = 0
 		self.max_single_bps = 0
-		self.response_headers = {}
+		self.response_headers = CaseInsensitiveDict()
 		self.status_code = 0
 
 	async def probe_request(self) -> tuple:
@@ -122,7 +149,7 @@ class ChunkManager:
 		try:
 			verify = self.verify if self.verify is not None else True
 			t = time.perf_counter()
-			probe_headers = dict(self.headers)
+			probe_headers = CaseInsensitiveDict(self.headers)
 			if self.allow_range_ends:
 				probe_headers["Range"] = "bytes=0-"
 			req = session.request(
@@ -143,18 +170,7 @@ class ChunkManager:
 					ait = asyncio.wait_for(ait, timeout=self.timeout)
 				it = await ait
 				assert resp.status_code != 416
-			except (
-				AssertionError,
-				TimeoutError,
-				asyncio.TimeoutError,
-				niquests.ConnectionError,
-				niquests.ConnectTimeout,
-				niquests.ReadTimeout,
-				niquests.Timeout,
-				niquests.exceptions.MultiplexingError,
-				niquests.exceptions.ChunkedEncodingError,
-				AttributeError,
-			):
+			except passable_exceptions:
 				if resp is not None:
 					if it is not None:
 						await it.aclose()
@@ -192,6 +208,48 @@ class ChunkManager:
 			await self.aclose()
 			raise
 
+	async def probe_curl(self) -> tuple:
+		t = time.perf_counter()
+		probe_headers = CaseInsensitiveDict(self.headers)
+		if self.allow_range_ends:
+			probe_headers["Range"] = "bytes=0-"
+		header_info = []
+		for k, v in probe_headers.items():
+			header_info.append("-H")
+			header_info.append(f"{k}: {v}")
+		args = [
+			"curl", "-sSf", "--head", "-X", self.method.upper(),
+			"--connect-timeout", str(min(3, self.timeout or 3)),
+			*header_info,
+			"-L", "--max-redirs", "9", self.url,
+		]
+		proc = await asyncio.create_subprocess_exec(
+			*args, stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		)
+		data, error = await proc.communicate()
+		decoded = data.strip().replace(b"\r\n", b"\n").decode("utf-8")
+		url = self.url
+		for checked_line in decoded.splitlines():
+			if checked_line.startswith("Location: "):
+				url = checked_line.removeprefix("Location: ")
+		lines = decoded.rsplit("\n\n", 1)[-1].splitlines()
+		info = lines[0]
+		status_code = int(info.split(None, 2)[1])
+		head_lines = [line.split(":", 1) for line in lines if ":" in line]
+		headers = CaseInsensitiveDict({k: v for k, v in head_lines})
+		resp = MockObject(
+			headers=headers,
+			status_code=status_code,
+			url=url,
+		)
+		self.status_code = status_code
+		self.response_headers.update(headers)
+		self.latency = time.perf_counter() - t
+		if status_code not in range(200, 400):
+			raise ConnectionError(status_code, error.decode("utf-8"))
+		return resp, None
+
 	def update_progress(self, force=False) -> float | None:
 		if not self.log_progress:
 			return
@@ -209,9 +267,7 @@ class ChunkManager:
 		dt = max(0.001, ct - self.timestamp)
 		timer = time_disp(dt)
 		progress = 1 if self.done else self.progress / self.size if self.size > 0 else 0
-		percentage = round(progress * 100, 4)
-		if percentage.is_integer():
-			percentage = int(percentage)
+		percentage = "%8.4f" % (progress * 100)
 		bpst = calc_bps(self.bps)
 		completed = sum(not worker.is_running() for worker in self.workers)
 		chunk_count = len(self.workers)
@@ -220,10 +276,11 @@ class ChunkManager:
 		print(s, end="\r")
 		return progress
 
-	async def join(self, close=False) -> io.BufferedIOBase | str:
+	async def join(self, loop=None, close=False) -> io.BufferedIOBase | str:
+		loop = loop or asyncio.get_event_loop()
 		futs = []
-		self.workers[0].do(stream=True)
-		shattering = asyncio.create_task(self.shatter())
+		self.workers[0].do(loop=loop, stream=True)
+		shattering = loop.create_task(self.shatter())
 		futs.append(shattering)
 		if self.fileobj is not None:
 			fp = self.fileobj
@@ -249,15 +306,15 @@ class ChunkManager:
 					worker = self.workers[index]
 					worker.is_target = True
 					stream = index == 0
-					fc = worker.do()
+					fc = worker.do(loop=loop)
 					if stream:
 						async for b in fc:
-							await asyncio.get_event_loop().run_in_executor(executor, fp.write, b)
+							await loop.run_in_executor(executor, fp.write, b)
 					else:
 						futs.append(fc)
 						fc = await fc
 						with fc:
-							await asyncio.get_event_loop().run_in_executor(executor, shutil.copyfileobj, fc, fp)
+							await loop.run_in_executor(executor, shutil.copyfileobj, fc, fp)
 					worker.done = True
 					index += 1
 				if not is_stream:
@@ -271,7 +328,10 @@ class ChunkManager:
 					assert self.size <= 0 or asize == self.size, f"Expected {self.size} bytes, received {asize}"
 			finally:
 				while futs:
-					await asyncio.wait_for(futs.pop(0), timeout=1)
+					try:
+						await asyncio.wait_for(futs.pop(0), timeout=1)
+					except asyncio.TimeoutError:
+						pass
 				if not is_stream and os.path.exists(fp.name):
 					fp.close()
 					os.remove(fp.name)
@@ -284,16 +344,15 @@ class ChunkManager:
 			assert self.filename
 			return self.filename
 		if is_stream:
-			return fp
+			return fp  # ty:ignore[invalid-return-type]
 		assert self.filename
 		return open(self.filename, "rb")
 
 	async def shatter(self):
 		if not self.concurrent_limit or self.size <= 0:
 			return
-		worker = self.workers[0]
 		while self.workers:
-			await asyncio.sleep(0.25)
+			await asyncio.sleep(self.workers[0].latency + 0.05)
 			remaining = [worker for worker in self.workers if worker.is_running()]
 			if not remaining:
 				break
@@ -316,9 +375,22 @@ class ChunkManager:
 			ratio = max(1 / 64, min(1 / 2, worker.bps / (avg_bps + worker.bps)))
 			worker.split(ratio)
 
-	async def start(self, close=False) -> io.BufferedIOBase | str:
+	async def start(self, loop=None, close=False) -> io.BufferedIOBase | str:
+		stop_loop = bool(loop)
+		loop = loop or asyncio.get_event_loop()
 		self.timestamp = time.perf_counter()
-		resp, it = await self.probe_request()
+		if self.use_curl:
+			try:
+				resp, it = await self.probe_curl()
+			except Exception:
+				print_exc()
+				resp, it = await self.probe_request()
+		else:
+			try:
+				resp, it = await self.probe_request()
+			except Exception:
+				print_exc()
+				resp, it = await self.probe_curl()
 		if not self.filename or self.filename.replace("\\", "/").endswith("/"):
 			if self.filename:
 				path = os.path.abspath(self.filename)
@@ -362,13 +434,27 @@ class ChunkManager:
 			url=resp.url,
 		)
 		self.workers.append(worker)
-		return await self.join(close=close)
+		try:
+			out = await self.join(loop=loop, close=close)
+			return out
+		finally:
+			if stop_loop:
+				async def stop_after(delay):
+					await asyncio.sleep(delay)
+					loop.stop()
+				loop.create_task(stop_after(0.01))
 
 	def run(self, close=False, return_headers=False):
 		# import selectors
 		# loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
 		loop = asyncio.new_event_loop()
-		resp = loop.run_until_complete(self.start(close=close))
+		event_loops.add(loop)
+		try:
+			loop.create_task(self.start(loop=loop, close=close))
+			resp = loop.run_forever()
+		finally:
+			event_loops.discard(loop)
+			loop.close()
 		if return_headers:
 			return resp, self.response_headers
 		return resp
@@ -395,11 +481,9 @@ class ChunkManager:
 		return bps
 
 
-_range = range
-
 class ChunkWorker:
 
-	def __init__(self, ctx: ChunkManager, range: _range | None = None, resp: niquests.AsyncResponse | None = None, it: collections.abc.AsyncGenerator | None = None, url: str | None = None):
+	def __init__(self, ctx: ChunkManager, range: _range | None = None, resp: niquests.AsyncResponse | None = None, it: collections.abc.AsyncGenerator | None = None, url: str = ""):
 		self.ctx = ctx
 		self.running = None
 		headers = ctx.headers
@@ -420,53 +504,88 @@ class ChunkWorker:
 		self.recv_times = []
 		self.done = False
 		self.error = None
+		self.s_error = ""
 		self.needs_restart = False
 		self.restart_cooldown = 5
 		self.is_target = False
 
-	async def refresh_resp(self, attempt=0, timeout=None) -> niquests.AsyncResponse:
-		if self.resp is None:
+	async def refresh_resp(self, attempt=0, timeout=None) -> niquests.AsyncResponse | asyncio.subprocess.Process:
+		if self.resp is None or self.it is None:
 			ctx = self.ctx
 			self.timestamp = time.perf_counter()
 			self.last_split = self.timestamp
 			self.ttfr = inf
-			if attempt > 1 or not ctx.request_count & 15:
-				self.url = ctx.url
-				ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
-				ctx.sessions.add(session)
-			else:
-				session = ctx.session
 			headers = self.headers.copy()
 			headers["Priority"] = "i"
 			if ctx.allow_range_ends:
 				headers["Range"] = f"bytes={self.start + self.pos}-{self.end - 1}"
 			else:
 				headers["Range"] = f"bytes={self.start + self.pos}-"
-			req = session.request(
-				ctx.method,
-				self.url,
-				headers=headers,
-				data=ctx.data,
-				stream=True,
-				verify=ctx.verify,
-				timeout=timeout,
-			)
-			if timeout:
-				req = asyncio.wait_for(req, timeout=timeout + 1)
-			ctx.request_count += 1
-			self.resp = await req
-			ait = self.resp.iter_content(CHUNK_SIZE if attempt else CHUNK_SIZE * 8)
-			if timeout:
-				ait = asyncio.wait_for(ait, timeout=timeout)
-			self.it = await ait
-			if "Range" in self.headers:
-				range_sent = self.headers["Range"].split("=", 1)[-1].split("-", 1)[0]
-				range_recv = self.resp.headers["content-range"].split("/", 1)[0].split(None, 1)[-1].split("-", 1)[0]
-				assert range_recv == range_sent, "Server failed to serve range header as specified!"
+			# print(headers["Range"])
+			if not ctx.use_curl and attempt < 10:
+				if attempt > 1 or not ctx.request_count & 15:
+					self.url = ctx.url
+					ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
+					ctx.sessions.add(session)
+				else:
+					session = ctx.session
+				req = session.request(
+					ctx.method,
+					self.url,
+					headers=headers,
+					data=ctx.data,
+					stream=True,
+					verify=ctx.verify,
+					timeout=timeout,
+				)
+				if timeout:
+					req = asyncio.wait_for(req, timeout=timeout + 1)
+				ctx.request_count += 1
+				self.resp = await req
+				ait = self.resp.iter_content(CHUNK_SIZE if attempt else CHUNK_SIZE * 8)
+				if timeout:
+					ait = asyncio.wait_for(ait, timeout=timeout)
+				self.it = await ait
+				if "Range" in self.headers:
+					range_sent = self.headers["Range"].split("=", 1)[-1].split("-", 1)[0]
+					range_recv = self.resp.headers["content-range"].split("/", 1)[0].split(None, 1)[-1].split("-", 1)[0]
+					assert range_recv == range_sent, "Server failed to serve range header as specified!"
+				self.resp.raise_for_status()
+			else:
+				header_info = []
+				for k, v in headers.items():
+					header_info.append("-H")
+					header_info.append(f"{k}: {v}")
+				args = [
+					"curl", "-sSf", "-X", ctx.method.upper(),
+					"--connect-timeout", str(timeout or 3),
+					*header_info, self.url,
+				]
+				proc = await asyncio.create_subprocess_exec(
+					*args, stdin=subprocess.DEVNULL,
+					stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+				)
+
+				async def scan_error():
+					while proc.returncode is None and not self.s_error:
+						try:
+							await asyncio.wait_for(proc.wait(), 0.01)
+						except asyncio.TimeoutError:
+							self.s_error = (await proc.stderr.readline()).strip().decode("utf-8")  # ty:ignore[unresolved-attribute]
+					if proc.returncode is None:
+						try:
+							return proc.terminate()
+						except ProcessLookupError:
+							pass
+
+				asyncio.get_event_loop().create_task(scan_error())
+				self.resp = proc
+				self.it = None
+				await asyncio.sleep(self.latency / 2 + 0.05)
 			self.latency = time.perf_counter() - self.timestamp
 			self.error = None
+			self.s_error = ""
 			self.needs_restart = False
-		self.resp.raise_for_status()
 		return self.resp
 
 	def split(self, ratio=0.5):
@@ -494,11 +613,14 @@ class ChunkWorker:
 			t = time.perf_counter()
 			try:
 				await self.refresh_resp(attempt=attempt, timeout=timeout)
-				assert self.it is not None
 				try:
 					while True:
 						t = time.perf_counter()
-						fut = self.it.__anext__()
+						if self.it is not None:
+							fut = self.it.__anext__()
+						else:
+							assert not self.s_error, self.s_error
+							fut = self.resp.stdout.read(CHUNK_SIZE)  # ty:ignore[unresolved-attribute]
 						content = await asyncio.wait_for(fut, timeout=timeout)
 						expected = self.remainder
 						if len(content) > expected:
@@ -510,26 +632,14 @@ class ChunkWorker:
 						self.pos += length
 						self.recv_times.append((t, length))
 						if self.pos >= self.size:
-							break
+							return
 						if not isfinite(self.ttfr):
 							self.ttfr = time.perf_counter() - self.timestamp
 						ctx.update_progress()
-						if self.needs_restart:
-							raise AttributeError
+						assert not self.needs_restart, "Restarting slow request..."
 				except (StopIteration, StopAsyncIteration):
 					pass
-				if self.remainder <= 0 or not ctx.size:
-					break
-			except (
-				TimeoutError,
-				asyncio.TimeoutError,
-				niquests.ConnectionError,
-				niquests.ConnectTimeout,
-				niquests.ReadTimeout,
-				niquests.Timeout,
-				niquests.exceptions.ChunkedEncodingError,
-				AttributeError,
-			) as ex:
+			except passable_exceptions as ex:
 				if ctx.debug:
 					print(repr(ex))
 				self.error = ex
@@ -545,9 +655,16 @@ class ChunkWorker:
 				await asyncio.sleep(2 ** attempt)
 			finally:
 				if self.resp is not None:
-					if self.it is not None:
-						await self.it.aclose()
-					await self.resp.close()
+					try:
+						if self.it is not None:
+							await self.it.aclose()
+						if isinstance(self.resp, asyncio.subprocess.Process):
+							if self.resp.returncode is None:
+								self.resp.terminate()
+						else:
+							await self.resp.close()
+					except Exception:
+						pass
 					self.resp = None
 				ctx.update_progress(force=True)
 			if attempt + 1 >= ctx.max_attempts:
@@ -564,7 +681,7 @@ class ChunkWorker:
 		self.fp.seek(0)
 		return self.fp
 
-	def do(self, stream=False) -> collections.abc.Awaitable:
+	def do(self, loop=None, stream=False) -> collections.abc.Awaitable:
 		if self.running:
 			return self.running
 		if stream:
@@ -572,7 +689,8 @@ class ChunkWorker:
 			self.running = fut
 		else:
 			fut = self.run()
-			self.running = asyncio.create_task(fut)
+			loop = loop or asyncio.get_event_loop()
+			self.running = loop.create_task(fut)
 		return self.running
 
 	def split_priority(self, multiplier=1) -> float:
@@ -627,7 +745,7 @@ class ChunkWorker:
 		return not self.done
 
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, return_headers=False):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -642,6 +760,8 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		log_progress=log_progress,
 		timeout=timeout,
 		max_attempts=max_attempts,
+		multiplexed=multiplexed,
+		use_curl=use_curl,
 	)
 	resp = await ctx.start()
 	if return_headers:
@@ -649,7 +769,7 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	return resp
 parallel_request = shatter_request
 
-def download(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, return_headers=False):
+def download(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -664,6 +784,8 @@ def download(url, method="get", headers={}, data=None, filename=None, fileobj=No
 		log_progress=log_progress,
 		timeout=timeout,
 		max_attempts=max_attempts,
+		multiplexed=multiplexed,
+		use_curl=use_curl,
 	)
 	resp = ctx.run()
 	if return_headers:
@@ -692,13 +814,14 @@ def main():
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
 	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
+	parser.add_argument("-c", "--curl", action=argparse.BooleanOptionalAction, default=False, help="Use the `curl` tool as the main downloader; defaults to FALSE")
 	parser.add_argument("url", help="Target URL", nargs="?", default="")
 	parser.add_argument("filename", help='Output filename; use "-" for stdout pipe', nargs="?", default="")
 	args = parser.parse_args()
 	if not args.url:
 		args.url = input("Please use `streamshatter -h` for help, or input a URL to download directly: ").strip()
 	if os.name == "nt":
-		os.system("color")
+		subprocess.run("color", shell=True)
 	download(
 		url=args.url,
 		headers=json.loads(args.headers),
@@ -710,6 +833,8 @@ def main():
 		log_progress=args.log_progress,
 		timeout=args.timeout,
 		max_attempts=args.max_attempts,
+		multiplexed=False,
+		use_curl=args.curl,
 	)
 
 if __name__ == "__main__":
