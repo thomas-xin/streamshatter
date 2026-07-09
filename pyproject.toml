@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "streamshatter"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
     "niquests>=3.19.1",
     "urllib3-future>=2.21.902",

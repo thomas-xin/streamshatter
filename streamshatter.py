@@ -152,6 +152,8 @@ class ChunkManager:
 			probe_headers = CaseInsensitiveDict(self.headers)
 			if self.allow_range_ends:
 				probe_headers["Range"] = "bytes=0-"
+			if self.debug:
+				print(probe_headers)
 			req = session.request(
 				self.method,
 				self.url,
@@ -179,6 +181,8 @@ class ChunkManager:
 				self.session = session = generate_session(self.multiplexed)
 				self.sessions.add(session)
 				verify = self.verify or False
+				if self.debug:
+					print(self.headers)
 				req = session.request(
 					self.method,
 					self.url,
@@ -519,10 +523,13 @@ class ChunkWorker:
 			headers["Priority"] = "i"
 			if ctx.allow_range_ends:
 				headers["Range"] = f"bytes={self.start + self.pos}-{self.end - 1}"
-			else:
+			elif self.start + self.pos:
 				headers["Range"] = f"bytes={self.start + self.pos}-"
-			# print(headers["Range"])
-			if not ctx.use_curl and attempt < 10:
+			else:
+				headers.pop("Range", None)
+			if ctx.debug:
+				print(headers)
+			if not ctx.use_curl and attempt < min(10, ctx.max_attempts - 2):
 				if attempt > 1 or not ctx.request_count & 15:
 					self.url = ctx.url
 					ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
@@ -627,10 +634,12 @@ class ChunkWorker:
 							content = memoryview(content)[:expected]
 						length = len(content)
 						if length <= 0:
-							break
+							raise StopIteration
 						yield content
 						self.pos += length
 						self.recv_times.append((t, length))
+						if ctx.debug:
+							print(self.pos, length, self.size, ctx.size)
 						if self.pos >= self.size:
 							return
 						if not isfinite(self.ttfr):
@@ -638,7 +647,8 @@ class ChunkWorker:
 						ctx.update_progress()
 						assert not self.needs_restart, "Restarting slow request..."
 				except (StopIteration, StopAsyncIteration):
-					pass
+					if not ctx.size:
+						break
 			except passable_exceptions as ex:
 				if ctx.debug:
 					print(repr(ex))
