@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from traceback import print_exc
+import urllib.parse
 import niquests
 from niquests.structures import CaseInsensitiveDict
 
@@ -28,7 +29,7 @@ COLOURS.append("\x1b[38;5;15m█")
 _range = range
 event_loops = set()
 
-def generate_session(multiplexed=True):
+def generate_session(multiplexed=True) -> niquests.AsyncSession:
 	return niquests.AsyncSession(
 		multiplexed=multiplexed,
 		pool_connections=24,
@@ -38,7 +39,7 @@ def generate_session(multiplexed=True):
 def header():
 	return {
 		"Accept": "*/*",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0 AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36 Edg/134.0.3124.85",
+		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
 		"DNT": "1",
 		"X-Forwarded-For": "34." + ".".join(str(random.randint(1, 254)) for _ in range(3)),
 	}
@@ -88,6 +89,20 @@ def sample(arr, n):
 		return [arr[int(i)] * (1 - i % 1) + arr[int(i) + 1] * (i % 1) for i in indices]
 	return arr
 
+def is_local_url(url) -> bool:
+	parsed = urllib.parse.urlparse(url)
+	hostname = parsed.hostname
+	if not hostname:
+		return False
+	if hostname.casefold() == "localhost":
+		return True
+	import ipaddress
+	try:
+		ip = ipaddress.ip_address(hostname)
+	except ValueError:
+		return False
+	return ip.is_private or ip.is_loopback or ip.is_link_local
+
 passable_exceptions = (
 	ConnectionResetError,
 	ConnectionAbortedError,
@@ -112,7 +127,7 @@ class MockObject:
 
 class ChunkManager:
 
-	def __init__(self, url: str, method: str = "get", headers: dict = {}, data: bytes | None = None, filename: str | None = None, fileobj: io.BufferedReader | None = None, concurrent_limit: int = 64, size_limit: int = 1099511627776, verify: bool | None = None, debug: bool = False, log_progress: bool = True, timeout: float | None = None, max_attempts: float = inf, multiplexed: bool = True, use_curl: bool = False):
+	def __init__(self, url: str, method: str = "get", headers: dict = {}, data: bytes | None = None, filename: str | None = None, fileobj: io.BufferedReader | None = None, concurrent_limit: int = 64, size_limit: int = 1099511627776, verify: bool | None = None, debug: bool = False, log_progress: bool = True, block_local: bool = True, timeout: float | None = None, max_attempts: float = inf, multiplexed: bool = True, use_curl: bool = False):
 		self.url = url
 		self.method = method
 		self.headers = header()
@@ -125,6 +140,7 @@ class ChunkManager:
 		self.verify = verify
 		self.debug = debug
 		self.log_progress = log_progress
+		self.block_local = block_local
 		self.timeout = timeout
 		self.max_attempts = max_attempts
 		self.multiplexed = multiplexed and self.concurrent_limit > 1
@@ -141,7 +157,13 @@ class ChunkManager:
 		self.response_headers = CaseInsensitiveDict()
 		self.status_code = 0
 
+	def isnt_local(self, url: str = ""):
+		url = url or self.url
+		if self.block_local and is_local_url(url):
+			raise PermissionError(403, f"URL detected as local: {url}")
+
 	async def probe_request(self) -> tuple:
+		self.isnt_local()
 		self.session = session = generate_session(self.multiplexed)
 		self.sessions.add(session)
 		resp = None
@@ -154,65 +176,80 @@ class ChunkManager:
 				probe_headers["Range"] = "bytes=0-"
 			if self.debug:
 				print(probe_headers)
-			req = session.request(
-				self.method,
-				self.url,
-				headers=probe_headers,
-				data=self.data,
-				stream=True,
-				verify=verify,
-				timeout=min(3, self.timeout or 3),
-			)
-			resp = None
-			try:
-				self.request_count += 1
-				resp = await asyncio.wait_for(req, timeout=4)
-				ait = resp.iter_content(CHUNK_SIZE)
-				if self.timeout:
-					ait = asyncio.wait_for(ait, timeout=self.timeout)
-				it = await ait
-				assert resp.status_code != 416
-			except passable_exceptions:
-				if resp is not None:
-					if it is not None:
-						await it.aclose()
-					await resp.close()
-				self.multiplexed = False
-				self.session = session = generate_session(self.multiplexed)
-				self.sessions.add(session)
-				verify = self.verify or False
-				if self.debug:
-					print(self.headers)
+			seen_urls = set()
+			url = self.url
+			while True:
+				self.isnt_local(url)
 				req = session.request(
 					self.method,
 					self.url,
-					headers=self.headers,
+					headers=probe_headers,
 					data=self.data,
 					stream=True,
 					verify=verify,
-					timeout=self.timeout,
+					timeout=min(3, self.timeout or 3),
+					allow_redirects=False,
 				)
-				if self.timeout:
-					req = asyncio.wait_for(req, timeout=self.timeout + 1)
-				self.request_count += 1
-				resp = await req
-				ait = resp.iter_content(CHUNK_SIZE)
-				if self.timeout:
-					ait = asyncio.wait_for(ait, timeout=self.timeout)
-				it = await ait
+				resp = None
+				try:
+					self.request_count += 1
+					resp = await asyncio.wait_for(req, timeout=4)
+					ait = resp.iter_content(CHUNK_SIZE)
+					if self.timeout:
+						ait = asyncio.wait_for(ait, timeout=self.timeout)
+					it = await ait
+					assert resp.status_code != 416
+				except passable_exceptions:
+					if resp is not None:
+						if it is not None:
+							await it.aclose()
+						await resp.close()
+					self.multiplexed = False
+					self.session = session = generate_session(self.multiplexed)
+					self.sessions.add(session)
+					verify = self.verify or False
+					if self.debug:
+						print(self.headers)
+					req = session.request(
+						self.method,
+						self.url,
+						headers=self.headers,
+						data=self.data,
+						stream=True,
+						verify=verify,
+						timeout=self.timeout,
+						allow_redirects=False,
+					)
+					if self.timeout:
+						req = asyncio.wait_for(req, timeout=self.timeout + 1)
+					self.request_count += 1
+					resp = await req
+					ait = resp.iter_content(CHUNK_SIZE)
+					if self.timeout:
+						ait = asyncio.wait_for(ait, timeout=self.timeout)
+					it = await ait
+				if resp.status_code not in range(300, 400):
+					break
+				url = resp.headers.get("Location", "") or url
+				if url in seen_urls:
+					break
+				seen_urls.add(url)
 			self.verify = verify
 			self.status_code = resp.status_code
 			self.response_headers.update(resp.headers)
 			resp.raise_for_status()
 			self.latency = time.perf_counter() - t
 			return resp, it
-		except Exception:
+		except BaseException as ex:
 			if resp is not None:
 				await resp.close()
 			await self.aclose()
+			if not isinstance(ex, Exception):
+				raise RuntimeError(ex)
 			raise
 
 	async def probe_curl(self) -> tuple:
+		self.isnt_local()
 		t = time.perf_counter()
 		probe_headers = CaseInsensitiveDict(self.headers)
 		if self.allow_range_ends:
@@ -221,27 +258,39 @@ class ChunkManager:
 		for k, v in probe_headers.items():
 			header_info.append("-H")
 			header_info.append(f"{k}: {v}")
-		args = [
-			"curl", "-sSf", "--head", "-X", self.method.upper(),
-			"--connect-timeout", str(min(3, self.timeout or 3)),
-			*header_info,
-			"-L", "--max-redirs", "9", self.url,
-		]
-		proc = await asyncio.create_subprocess_exec(
-			*args, stdin=subprocess.DEVNULL,
-			stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-		)
-		data, error = await proc.communicate()
-		decoded = data.strip().replace(b"\r\n", b"\n").decode("utf-8")
+		seen_urls = set()
 		url = self.url
-		for checked_line in decoded.splitlines():
-			if checked_line.startswith("Location: "):
-				url = checked_line.removeprefix("Location: ")
-		lines = decoded.rsplit("\n\n", 1)[-1].splitlines()
-		info = lines[0]
-		status_code = int(info.split(None, 2)[1])
-		head_lines = [line.split(":", 1) for line in lines if ":" in line]
-		headers = CaseInsensitiveDict({k: v for k, v in head_lines})
+		while True:
+			self.isnt_local(url)
+			args = [
+				"curl", "-sSf", "--head", "-X", self.method.upper(),
+				"--connect-timeout", str(min(3, self.timeout or 3)),
+				*header_info,
+				"-L", "--max-redirs", "0", self.url,
+			]
+			proc = await asyncio.create_subprocess_exec(
+				*args, stdin=subprocess.DEVNULL,
+				stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+			)
+			data, error = await proc.communicate()
+			decoded = data.strip().replace(b"\r\n", b"\n").decode("utf-8")
+			url = self.url
+			for checked_line in decoded.splitlines():
+				if checked_line.startswith("Location: "):
+					url = checked_line.removeprefix("Location: ")
+			if self.block_local and is_local_url(url):
+				raise AssertionError(f"URL detected as local:", url)
+			lines = decoded.rsplit("\n\n", 1)[-1].splitlines()
+			info = lines[0]
+			status_code = int(info.split(None, 2)[1])
+			head_lines = [line.split(":", 1) for line in lines if ":" in line]
+			headers = CaseInsensitiveDict({k: v for k, v in head_lines})
+			if status_code not in range(300, 400):
+				break
+			url = headers.get("Location", "") or url
+			if url in seen_urls:
+				break
+			seen_urls.add(url)
 		resp = MockObject(
 			headers=headers,
 			status_code=status_code,
@@ -382,65 +431,70 @@ class ChunkManager:
 	async def start(self, loop=None, close=False) -> io.BufferedIOBase | str:
 		stop_loop = bool(loop)
 		loop = loop or asyncio.get_event_loop()
-		self.timestamp = time.perf_counter()
-		if self.use_curl:
-			try:
-				resp, it = await self.probe_curl()
-			except Exception:
-				print_exc()
-				resp, it = await self.probe_request()
-		else:
-			try:
-				resp, it = await self.probe_request()
-			except Exception:
-				print_exc()
-				resp, it = await self.probe_curl()
-		if not self.filename or self.filename.replace("\\", "/").endswith("/"):
-			if self.filename:
-				path = os.path.abspath(self.filename)
-				os.makedirs(path, exist_ok=True)
+		try:
+			self.timestamp = time.perf_counter()
+			if self.use_curl:
+				try:
+					resp, it = await self.probe_curl()
+				except Exception:
+					print_exc()
+					resp, it = await self.probe_request()
 			else:
-				path = os.path.abspath(os.curdir)
-			filename: str = (
-				resp.headers.get("attachment-filename")
-				or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].lstrip('"').split('"', 1)[0].strip().strip('"').strip("'")
-				or self.url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+				try:
+					resp, it = await self.probe_request()
+				except Exception:
+					print_exc()
+					resp, it = await self.probe_curl()
+			if not self.filename or self.filename.replace("\\", "/").endswith("/"):
+				if self.filename:
+					path = os.path.abspath(self.filename)
+					os.makedirs(path, exist_ok=True)
+				else:
+					path = os.path.abspath(os.curdir)
+				filename: str = (
+					resp.headers.get("attachment-filename")
+					or resp.headers.get("content-disposition", "").split("filename=", 1)[-1].lstrip('"').split('"', 1)[0].strip().strip('"').strip("'")
+					or self.url.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+				)
+				import re
+				filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", filename)
+				if "." not in filename:
+					ctype = resp.headers.get("content-type")
+					if ctype and ctype != "application/octet-stream":
+						import mimetypes
+						ext = mimetypes.guess_extension(ctype)
+						if ext:
+							filename = filename + "." + ext
+				self.filename = os.path.join(path, filename)
+			elif not self.fileobj and self.filename == "-":
+				self.fileobj = (sys.__stdout__ or sys.stdout).buffer
+				sys.stdout = sys.stderr
+			try:
+				self.size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
+			except (KeyError, ValueError):
+				self.size = 0
+			if (
+				self.size <= 0
+				or "content-range" not in resp.headers and "bytes" not in resp.headers.get("accept-ranges", "").lower()
+				or resp.headers.get("content-encoding") not in (None, "identity")
+			):
+				self.size = 0
+				self.concurrent_limit = 0
+				self.allow_range_ends = False
+			worker = ChunkWorker(
+				ctx=self,
+				resp=resp,
+				it=it,
+				url=resp.url,
 			)
-			import re
-			filename = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", filename)
-			if "." not in filename:
-				ctype = resp.headers.get("content-type")
-				if ctype and ctype != "application/octet-stream":
-					import mimetypes
-					ext = mimetypes.guess_extension(ctype)
-					if ext:
-						filename = filename + "." + ext
-			self.filename = os.path.join(path, filename)
-		elif not self.fileobj and self.filename == "-":
-			self.fileobj = (sys.__stdout__ or sys.stdout).buffer
-			sys.stdout = sys.stderr
-		try:
-			self.size = int(resp.headers.get("content-length") or resp.headers["content-range"].rsplit("/", 1)[-1])
-		except (KeyError, ValueError):
-			self.size = 0
-		if (
-			self.size <= 0
-			or "content-range" not in resp.headers and "bytes" not in resp.headers.get("accept-ranges", "").lower()
-			or resp.headers.get("content-encoding") not in (None, "identity")
-		):
-			self.size = 0
-			self.concurrent_limit = 0
-			self.allow_range_ends = False
-		worker = ChunkWorker(
-			ctx=self,
-			resp=resp,
-			it=it,
-			url=resp.url,
-		)
-		self.workers.append(worker)
-		try:
-			out = await self.join(loop=loop, close=close)
-			return out
+			self.workers.append(worker)
+			try:
+				out = await self.join(loop=loop, close=close)
+				return out
+			except BaseException as ex:
+				if not isinstance(ex, Exception):
+					raise RuntimeError(ex)
+				raise
 		finally:
 			if stop_loop:
 				async def stop_after(delay):
@@ -454,9 +508,10 @@ class ChunkManager:
 		loop = asyncio.new_event_loop()
 		event_loops.add(loop)
 		try:
-			loop.create_task(self.start(loop=loop, close=close))
+			task = loop.create_task(self.start(loop=loop, close=close))
 			resp = loop.run_forever()
 		finally:
+			task.cancel()
 			event_loops.discard(loop)
 			loop.close()
 		if return_headers:
@@ -513,7 +568,7 @@ class ChunkWorker:
 		self.restart_cooldown = 5
 		self.is_target = False
 
-	async def refresh_resp(self, attempt=0, timeout=None) -> niquests.AsyncResponse | asyncio.subprocess.Process:
+	async def refresh_resp(self, attempt=0, timeout=5) -> niquests.AsyncResponse | asyncio.subprocess.Process:
 		if self.resp is None or self.it is None:
 			ctx = self.ctx
 			self.timestamp = time.perf_counter()
@@ -529,7 +584,7 @@ class ChunkWorker:
 				headers.pop("Range", None)
 			if ctx.debug:
 				print(headers)
-			if not ctx.use_curl and attempt < min(10, ctx.max_attempts - 2):
+			if not ctx.use_curl and attempt < min(10, ctx.max_attempts - 2) and attempt != 2:
 				if attempt > 1 or not ctx.request_count & 15:
 					self.url = ctx.url
 					ctx.session = session = generate_session(False if attempt > 2 else ctx.multiplexed)
@@ -755,7 +810,7 @@ class ChunkWorker:
 		return not self.done
 
 
-async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
+async def shatter_request(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, block_local=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -768,6 +823,7 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 		verify=verify,
 		debug=debug,
 		log_progress=log_progress,
+		block_local=block_local,
 		timeout=timeout,
 		max_attempts=max_attempts,
 		multiplexed=multiplexed,
@@ -779,7 +835,7 @@ async def shatter_request(url, method="get", headers={}, data=None, filename=Non
 	return resp
 parallel_request = shatter_request
 
-def download(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
+def download(url, method="get", headers={}, data=None, filename=None, fileobj=None, concurrent_limit=64, size_limit=1099511627776, verify=None, debug=False, log_progress=True, block_local=True, timeout=None, max_attempts=inf, multiplexed=True, use_curl=False, return_headers=False):
 	ctx = ChunkManager(
 		url=url,
 		method=method,
@@ -792,6 +848,7 @@ def download(url, method="get", headers={}, data=None, filename=None, fileobj=No
 		verify=verify,
 		debug=debug,
 		log_progress=log_progress,
+		block_local=block_local,
 		timeout=timeout,
 		max_attempts=max_attempts,
 		multiplexed=multiplexed,
@@ -824,6 +881,7 @@ def main():
 	parser.add_argument("-s", "--ssl", action=argparse.BooleanOptionalAction, default=True, help="Enforces SSL verification; defaults to TRUE")
 	parser.add_argument("-d", "--debug", action=argparse.BooleanOptionalAction, default=False, help="Terminates immediately upon non-timeout errors, and writes the response data for errored chunks; defaults to FALSE")
 	parser.add_argument("-lp", "--log-progress", action=argparse.BooleanOptionalAction, default=True, help="Continually updates a progress bar in the standard output; defaults to TRUE")
+	parser.add_argument("-bl", "--block-local", action=argparse.BooleanOptionalAction, default=True, help="Blocks any local URLs and redirects to local URLs; defaults to TRUE")
 	parser.add_argument("-c", "--curl", action=argparse.BooleanOptionalAction, default=False, help="Use the `curl` tool as the main downloader; defaults to FALSE")
 	parser.add_argument("url", help="Target URL", nargs="?", default="")
 	parser.add_argument("filename", help='Output filename; use "-" for stdout pipe', nargs="?", default="")
@@ -841,6 +899,7 @@ def main():
 		verify=args.ssl,
 		debug=args.debug,
 		log_progress=args.log_progress,
+		block_local=args.block_local,
 		timeout=args.timeout,
 		max_attempts=args.max_attempts,
 		multiplexed=False,
